@@ -1,0 +1,33 @@
+@import "tailwindcss";
+
+@theme {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --font-sans: var(--font-inter);
+  --font-mono: var(--font-geist-mono);
+}
+
+:root {
+  --background: #f4f5f7;
+  --foreground: #111827;
+  --primary: #1d4ed8; /* Blue-700 */
+  --primary-foreground: #ffffff;
+  --card: #ffffff;
+  --card-foreground: #111827;
+  --border: #e5e7eb;
+  --input: #f9fafb;
+  --ring: #3b82f6; /* Blue-500 */
+}
+
+body {
+  background-color: var(--background);
+  color: var(--foreground);
+}
