@@ -1,17 +1,21 @@
 export function getApiBaseUrl(): string {
   if (typeof window === "undefined") {
-    return process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:3011";
+    return process.env.NEXT_PUBLIC_API_URL || "https://maegler-ai-api.ai-beregner.dk";
   }
 
   const { protocol, hostname, port } = window.location;
 
-  // Dynamic sslip.io resolution for Coolify (127.0.0.1, 192.168.86.30, 100.100.55.20, etc.)
+  if (hostname.endsWith(".ai-beregner.dk")) {
+    const apiHostname = hostname.replace(/^maegler-ai\./, "maegler-ai-api.");
+    return `https://${apiHostname}`;
+  }
+
   if (hostname.startsWith("maegler-ai.") && hostname.endsWith(".sslip.io")) {
     const apiHostname = hostname.replace(/^maegler-ai\./, "maegler-ai-api.");
     return `${protocol}//${apiHostname}${port ? `:${port}` : ""}`;
   }
 
-  if (process.env.NEXT_PUBLIC_API_URL && !process.env.NEXT_PUBLIC_API_URL.includes("onrender.com")) {
+  if (process.env.NEXT_PUBLIC_API_URL) {
     return process.env.NEXT_PUBLIC_API_URL;
   }
 
