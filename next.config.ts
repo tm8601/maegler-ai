@@ -2,16 +2,19 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   output: "standalone",
-  async headers() {
-    return [
-      {
-        source: "/:path*",
-        headers: [
-          { key: "Strict-Transport-Security", value: "max-age=31536000; includeSubDomains" },
-          { key: "X-Content-Type-Options", value: "nosniff" },
-          { key: "X-Frame-Options", value: "SAMEORIGIN" },
-          { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
-        ],
+  cacheComponents: true,
+  partialPrefetching: true,
+  allowedDevOrigins: [
+    "127.0.0.1",
+    "192.168.86.47",
+    "100.126.14.87",
+    "*.ai-beregner.dk",
+  ],
+  turbopack: {
+    rules: {
+      "*.css": {
+        loaders: ["@tailwindcss/turbopack"],
+        as: "*.css",
       },
     ];
   },

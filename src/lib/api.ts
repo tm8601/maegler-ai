@@ -5,14 +5,9 @@ export function getApiBaseUrl(): string {
 
   const { protocol, hostname, port } = window.location;
 
-  if (hostname.endsWith(".ai-beregner.dk")) {
-    const apiHostname = hostname.replace(/^maegler-ai\./, "maegler-ai-api.");
-    return `https://${apiHostname}`;
-  }
-
-  if (hostname.startsWith("maegler-ai.") && hostname.endsWith(".sslip.io")) {
-    const apiHostname = hostname.replace(/^maegler-ai\./, "maegler-ai-api.");
-    return `${protocol}//${apiHostname}${port ? `:${port}` : ""}`;
+  // Dynamic ai-beregner.dk resolution for Coolify
+  if (hostname === "maegler-ai.ai-beregner.dk") {
+    return "https://maegler-ai-api.ai-beregner.dk";
   }
 
   if (process.env.NEXT_PUBLIC_API_URL) {

@@ -16,11 +16,11 @@ function isAllowedOrigin(origin: string | null): boolean {
     const url = new URL(origin);
     const h = url.hostname;
     if (
-      h === "127.0.0.1" ||
-      h === "localhost" ||
-      h === "192.168.86.30" ||
-      h === "100.100.55.20" ||
-      h.endsWith(".sslip.io")
+      host === "localhost" ||
+      host === "127.0.0.1" ||
+      host === "192.168.86.47" ||
+      host === "100.126.14.87" ||
+      host.endsWith(".ai-beregner.dk")
     ) {
       return true;
     }
