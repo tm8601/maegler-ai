@@ -2,10 +2,13 @@ import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 
 const ALLOWED_EXACT = new Set([
+  "https://maegler.ai-beregner.dk",
   "https://maegler-ai.ai-beregner.dk",
   "http://localhost:3000",
+  "http://localhost:3011",
   "http://localhost:3030",
   "http://127.0.0.1:3000",
+  "http://127.0.0.1:3011",
   "http://127.0.0.1:3030",
 ]);
 
@@ -32,7 +35,8 @@ function isAllowedOrigin(origin: string | null): boolean {
 
 export function proxy(request: NextRequest) {
   const origin = request.headers.get("origin");
-  const allowedOrigin = isAllowedOrigin(origin) ? origin || "*" : "https://maegler.ai-beregner.dk";
+  const allowed = isAllowedOrigin(origin);
+  const corsOrigin = allowed && origin ? origin : "https://maegler.ai-beregner.dk";
 
   if (request.method === "OPTIONS") {
     if (origin && !allowed) {
