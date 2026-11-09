@@ -8,8 +8,8 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
-  title: "Mægler AI | Bolighandel-GPT",
-  description: "Din intelligente AI-medarbejder til sagsbehandling og risikominimering i ejendomshandler.",
+  title: "Vejle Mægleren AI | 360° Sags- & Krydsrevisions-CRM",
+  description: "Din intelligente AI-medarbejder til 5-register krydsrevision og risikominimering i ejendomshandler.",
 };
 
 export default function RootLayout({
