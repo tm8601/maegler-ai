@@ -16,18 +16,35 @@
 }
 
 :root {
-  --background: #f4f5f7;
-  --foreground: #111827;
-  --primary: #1d4ed8; /* Blue-700 */
+  --background: #f8fafc;
+  --foreground: #0f172a;
+  --primary: #1d4ed8;
   --primary-foreground: #ffffff;
   --card: #ffffff;
-  --card-foreground: #111827;
-  --border: #e5e7eb;
-  --input: #f9fafb;
-  --ring: #3b82f6; /* Blue-500 */
+  --card-foreground: #0f172a;
+  --border: #e2e8f0;
+  --input: #f8fafc;
+  --ring: #2563eb;
 }
 
 body {
   background-color: var(--background);
   color: var(--foreground);
+}
+
+dialog:modal {
+  overscroll-behavior: contain;
+}
+
+dialog::backdrop {
+  background: rgba(15, 23, 42, 0.55);
+  backdrop-filter: blur(3px);
+  overflow: hidden;
+  overscroll-behavior: contain;
+}
+
+@media print {
+  .no-print {
+    display: none !important;
+  }
 }

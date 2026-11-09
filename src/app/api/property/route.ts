@@ -6,7 +6,7 @@ import { getTenantBudgetState } from "@/lib/ai-cost-guard";
 export async function GET(request: Request) {
   try {
     const { searchParams } = new URL(request.url);
-    const address = searchParams.get("q") || searchParams.get("address") || "Kløvertoften 38, 7100 Vejle";
+    const address = searchParams.get("q") || searchParams.get("address") || "H C Hansens Vej 29, 7100 Vejle";
     const husnummerId = searchParams.get("id") || undefined;
     const lat = searchParams.get("lat") ? Number(searchParams.get("lat")) : undefined;
     const lon = searchParams.get("lon") ? Number(searchParams.get("lon")) : undefined;
@@ -20,8 +20,8 @@ export async function GET(request: Request) {
 
     const sellerCase = upsertSellerCase({
       address: profile.adresse,
-      aiQuestions: profile.krydsrevision.dynamiskeSaelgerSpoergsmaal,
-      generatedAfsnit11Clauses: profile.krydsrevision.afsnit11Klausuler.map((k) => k.tekst),
+      aiQuestions: profile.saelgerSpoergsmaal,
+      generatedAfsnit11Clauses: profile.afsnit11Klausuler.map((k) => k.tekst),
     });
 
     const budget = getTenantBudgetState("vejle-maegleren");
