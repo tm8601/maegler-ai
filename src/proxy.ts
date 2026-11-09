@@ -14,13 +14,13 @@ function isAllowedOrigin(origin: string | null): boolean {
   if (ALLOWED_EXACT.has(origin)) return true;
   try {
     const url = new URL(origin);
-    const h = url.hostname;
+    const host = url.hostname.toLowerCase();
     if (
       host === "localhost" ||
       host === "127.0.0.1" ||
-      host === "192.168.86.47" ||
-      host === "100.126.14.87" ||
-      host.endsWith(".ai-beregner.dk")
+      host === "ai-beregner.dk" ||
+      host.endsWith(".ai-beregner.dk") ||
+      /^192\.168\.\d{1,3}\.\d{1,3}$/.test(host)
     ) {
       return true;
     }
@@ -32,8 +32,7 @@ function isAllowedOrigin(origin: string | null): boolean {
 
 export function proxy(request: NextRequest) {
   const origin = request.headers.get("origin");
-  const allowed = isAllowedOrigin(origin);
-  const corsOrigin = allowed && origin ? origin : "https://maegler-ai.ai-beregner.dk";
+  const allowedOrigin = isAllowedOrigin(origin) ? origin || "*" : "https://maegler.ai-beregner.dk";
 
   if (request.method === "OPTIONS") {
     if (origin && !allowed) {

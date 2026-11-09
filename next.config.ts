@@ -6,8 +6,8 @@ const nextConfig: NextConfig = {
   partialPrefetching: true,
   allowedDevOrigins: [
     "127.0.0.1",
-    "192.168.86.47",
-    "100.126.14.87",
+    "localhost",
+    "maegler.ai-beregner.dk",
     "*.ai-beregner.dk",
   ],
   turbopack: {
