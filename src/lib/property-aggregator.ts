@@ -2798,13 +2798,13 @@ export async function buildFullPropertyProfile(addressQuery: string): Promise<Pr
   // Visuel pakke URLs
   const eRound = Math.round(easting);
   const nRound = Math.round(northing);
-  const bbox25832 = `${eRound - 45},${nRound - 35},${eRound + 45},${nRound + 35}`;
+  const bbox25832 = `${eRound - 85},${nRound - 60},${eRound + 85},${nRound + 60}`;
   const dfKey = getDatafordelerKeys()[0] || "";
   const ortofotoWmsUrl = dfKey
     ? `https://wms.datafordeler.dk/GeoDanmarkOrto/orto_foraar/1.0.0/WMS?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=orto_foraar&STYLES=&CRS=EPSG:25832&BBOX=${bbox25832}&WIDTH=1000&HEIGHT=650&FORMAT=image/jpeg&apikey=${encodeURIComponent(
         dfKey
       )}`
-    : `https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/export?bbox=${(lon - 0.0008).toFixed(6)},${(lat - 0.0005).toFixed(6)},${(lon + 0.0008).toFixed(6)},${(lat + 0.0005).toFixed(6)}&bboxSR=4326&imageSR=3857&size=1000,650&format=jpg&f=image`;
+    : `https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/export?bbox=${(lon - 0.0014).toFixed(6)},${(lat - 0.0009).toFixed(6)},${(lon + 0.0014).toFixed(6)},${(lat + 0.0009).toFixed(6)}&bboxSR=4326&imageSR=3857&size=1000,650&format=jpg&f=image`;
 
   const googleKey = process.env.GOOGLE_MAPS_API_KEY || "";
   const streetViewUrl = googleKey
