@@ -787,7 +787,8 @@ async function queryVurderingsportalenGraphQL(query: string, timeoutMs = 4000): 
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "User-Agent":
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         Origin: "https://www.vurderingsportalen.dk",
         Referer: "https://www.vurderingsportalen.dk/",
         Accept: "application/json",
@@ -2090,7 +2091,8 @@ export async function buildFullPropertyProfile(addressQuery: string): Promise<Pr
                 enh027ArealTilBeboelse
                 enh028ArealTilErhverv
                 enh031AntalVaerelser
-                enh065AntalVandskyllendeToiletter
+                enh032Toiletforhold
+                enh033Badeforhold
                 enh066AntalBadevaerelser
               }
             }
@@ -2139,7 +2141,8 @@ export async function buildFullPropertyProfile(addressQuery: string): Promise<Pr
             enh026EnhedensSamledeAreal
             enh027ArealTilBeboelse
             enh031AntalVaerelser
-            enh065AntalVandskyllendeToiletter
+            enh032Toiletforhold
+            enh033Badeforhold
             enh066AntalBadevaerelser
           }
         }
@@ -2221,8 +2224,6 @@ export async function buildFullPropertyProfile(addressQuery: string): Promise<Pr
                 id_lokalId
                 registreretAreal
                 vejareal
-                fredskovAreal
-                strandbeskyttelseAreal
                 matrikelnummer
                 ejerlavLokalId
                 samletFastEjendomLokalId
@@ -2405,8 +2406,12 @@ export async function buildFullPropertyProfile(addressQuery: string): Promise<Pr
   );
   const antalEtager = Number(mainBuilding?.byg054AntalEtager || 1) || 1;
   const antalVaerelser = Number(mainEnhed?.enh031AntalVaerelser || 0) || null;
-  const antalBadevaerelser = Number(mainEnhed?.enh066AntalBadevaerelser || 0) || null;
-  const antalToiletter = Number(mainEnhed?.enh065AntalVandskyllendeToiletter || 0) || null;
+  const antalBadevaerelser =
+    Number(mainEnhed?.enh066AntalBadevaerelser || 0) ||
+    (String(mainEnhed?.enh033Badeforhold || "") === "V" ? 1 : null);
+  const antalToiletter =
+    Number(mainEnhed?.enh065AntalVandskyllendeToiletter || 0) ||
+    (String(mainEnhed?.enh032Toiletforhold || "") === "T" ? 1 : null);
 
   const tagKode = String(mainBuilding?.byg033Tagdaekningsmateriale || "");
   const tagTekst = BBR_ROOF_LABELS[tagKode] || (tagKode ? `Kode ${tagKode}` : "Ikke oplyst i BBR");
