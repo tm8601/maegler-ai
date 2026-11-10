@@ -255,7 +255,7 @@ export default function Home() {
       if (opts?.lat) params.set("lat", String(opts.lat));
       if (opts?.lon) params.set("lon", String(opts.lon));
 
-      const res = await fetch(`${getApiBaseUrl()}/api/property?${params.toString()}`);
+      const res = await fetch(`${getApiBaseUrl()}/sags-api/property?${params.toString()}`);
       if (res.ok) {
         const data = await res.json();
         if (data.profile) setProfile(data.profile);
@@ -293,7 +293,7 @@ export default function Home() {
       // Ignore
     }
 
-    fetch(`${getApiBaseUrl()}/api/auth`)
+    fetch(`${getApiBaseUrl()}/sags-api/auth`)
       .then((r) => r.json())
       .then((d) => {
         if (Array.isArray(d.agents)) setAvailableAgents(d.agents);
@@ -322,7 +322,7 @@ export default function Home() {
     const fetchAddress = async () => {
       setIsSearching(true);
       try {
-        const res = await fetch(`${getApiBaseUrl()}/api/dawa?q=${encodeURIComponent(address)}`);
+        const res = await fetch(`${getApiBaseUrl()}/sags-api/dawa?q=${encodeURIComponent(address)}`);
         const data = await res.json();
         if (Array.isArray(data)) {
           setSuggestions(data);
@@ -366,25 +366,20 @@ export default function Home() {
     setIsLoadingProfile(true);
     try {
       const res = await fetch(
-        `${getApiBaseUrl()}/api/cases?id=${encodeURIComponent(savedCase.id)}&reopen=1`
+        `${getApiBaseUrl()}/sags-api/cases?id=${encodeURIComponent(savedCase.id)}&reopen=1`
       );
       if (res.ok) {
-        const fullCase: SellerCaseRecord = await res.json();
+        const fullCase: SellerCaseRecord & { agentCases?: SellerCaseRecord[]; budget?: { spentDkk: number } } =
+          await res.json();
         if (fullCase.profileSnapshot) {
           syncCaseToState(fullCase, fullCase.profileSnapshot);
+          if (Array.isArray(fullCase.agentCases)) {
+            setAgentCases(fullCase.agentCases);
+          }
+          if (fullCase.budget && typeof fullCase.budget.spentDkk === "number") {
+            setLiveCostDkk(fullCase.budget.spentDkk);
+          }
           setIsLoadingProfile(false);
-          // Opdatér sagslisten i baggrunden med den korrekte mæglers e-mail
-          fetch(
-            `${getApiBaseUrl()}/api/cases?list=1&agentEmail=${encodeURIComponent(targetEmail)}`
-          )
-            .then((r) => r.json())
-            .then((d) => {
-              if (Array.isArray(d.cases)) setAgentCases(d.cases);
-              if (d.budget && typeof d.budget.spentDkk === "number") {
-                setLiveCostDkk(d.budget.spentDkk);
-              }
-            })
-            .catch(() => {});
           return;
         }
       }
@@ -399,7 +394,7 @@ export default function Home() {
   const handleDeleteSavedCase = async (idToDelete: string, e: React.MouseEvent) => {
     e.stopPropagation();
     try {
-      await fetch(`${getApiBaseUrl()}/api/cases?id=${encodeURIComponent(idToDelete)}`, {
+      await fetch(`${getApiBaseUrl()}/sags-api/cases?id=${encodeURIComponent(idToDelete)}`, {
         method: "DELETE",
       });
       const remaining = agentCases.filter((c) => c.id !== idToDelete);
@@ -418,7 +413,7 @@ export default function Home() {
     setLoginError(null);
     const targetEmail = quickAgent ? quickAgent.email : loginEmail;
     try {
-      const res = await fetch(`${getApiBaseUrl()}/api/auth`, {
+      const res = await fetch(`${getApiBaseUrl()}/sags-api/auth`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -442,18 +437,14 @@ export default function Home() {
       }
       loginDialogRef.current?.close();
 
-      // Hent mæglerens egne sager
-      const listRes = await fetch(
-        `${getApiBaseUrl()}/api/cases?list=1&agentEmail=${encodeURIComponent(data.user.email)}`
-      );
-      if (listRes.ok) {
-        const listData = await listRes.json();
-        if (Array.isArray(listData.cases)) {
-          setAgentCases(listData.cases);
-          if (listData.cases.length > 0) {
-            await handleSelectSavedCase(listData.cases[0], data.user);
-            return;
-          }
+      if (Array.isArray(data.cases)) {
+        setAgentCases(data.cases);
+        if (data.budget && typeof data.budget.spentDkk === "number") {
+          setLiveCostDkk(data.budget.spentDkk);
+        }
+        if (data.cases.length > 0) {
+          await handleSelectSavedCase(data.cases[0], data.user);
+          return;
         }
       }
       await loadPropertyProfile(address, { agent: data.user });
@@ -468,7 +459,7 @@ export default function Home() {
     setRenovationLevel(lvlKey);
     if (!activeCase || !profile) return;
     try {
-      const res = await fetch(`${getApiBaseUrl()}/api/cases`, {
+      const res = await fetch(`${getApiBaseUrl()}/sags-api/cases`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -501,7 +492,7 @@ export default function Home() {
     }
     const nextList = Array.from(currentResolved);
     try {
-      const res = await fetch(`${getApiBaseUrl()}/api/cases`, {
+      const res = await fetch(`${getApiBaseUrl()}/sags-api/cases`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -560,7 +551,7 @@ export default function Home() {
     });
 
     try {
-      const res = await fetch(`${getApiBaseUrl()}/api/analyze`, {
+      const res = await fetch(`${getApiBaseUrl()}/sags-api/analyze`, {
         method: "POST",
         body: formData,
       });
@@ -622,7 +613,7 @@ export default function Home() {
         uploadedAt: u.uploadedAt,
         matchedReminderId: u.matchedReminderId || null,
       }));
-      const saveRes = await fetch(`${getApiBaseUrl()}/api/cases`, {
+      const saveRes = await fetch(`${getApiBaseUrl()}/sags-api/cases`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -683,7 +674,7 @@ export default function Home() {
       if (!customPrompt) setAssistantInput("");
       setAssistantFiles([]);
 
-      const res = await fetch(`${getApiBaseUrl()}/api/case-assistant`, {
+      const res = await fetch(`${getApiBaseUrl()}/sags-api/case-assistant`, {
         method: "POST",
         body: formData,
       });
@@ -710,7 +701,7 @@ export default function Home() {
     const filtered = uploadedDocs.filter((item) => item.id !== id);
     setUploadedDocs(filtered);
     if (activeCase && profile) {
-      const saveRes = await fetch(`${getApiBaseUrl()}/api/cases`, {
+      const saveRes = await fetch(`${getApiBaseUrl()}/sags-api/cases`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -992,7 +983,7 @@ export default function Home() {
   const persistSellerInfo = async (nextName?: string, nextEmail?: string) => {
     if (!activeCase || !profile) return;
     try {
-      const res = await fetch(`${getApiBaseUrl()}/api/cases`, {
+      const res = await fetch(`${getApiBaseUrl()}/sags-api/cases`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1019,7 +1010,7 @@ export default function Home() {
       return;
     }
     try {
-      const res = await fetch(`${getApiBaseUrl()}/api/mail`, {
+      const res = await fetch(`${getApiBaseUrl()}/sags-api/mail`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1084,7 +1075,7 @@ export default function Home() {
       set.add(remId);
     }
     const nextArr = Array.from(set);
-    const res = await fetch(`${getApiBaseUrl()}/api/cases`, {
+    const res = await fetch(`${getApiBaseUrl()}/sags-api/cases`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({

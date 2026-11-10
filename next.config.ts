@@ -10,6 +10,14 @@ const nextConfig: NextConfig = {
       },
     },
   },
+  async rewrites() {
+    return [
+      {
+        source: "/sags-api/:path*",
+        destination: "/api/:path*",
+      },
+    ];
+  },
   async headers() {
     return [
       {

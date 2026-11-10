@@ -27,7 +27,7 @@ export default function SellerPortal() {
   useEffect(() => {
     const loadCase = async () => {
       try {
-        const res = await fetch(`${getApiBaseUrl()}/api/cases?id=${encodeURIComponent(caseId)}`);
+        const res = await fetch(`${getApiBaseUrl()}/sags-api/cases?id=${encodeURIComponent(caseId)}`);
         if (res.ok) {
           const data = await res.json();
           setAddress(data.address || "H C Hansens Vej 29, 7100 Vejle");
@@ -70,7 +70,7 @@ export default function SellerPortal() {
   ) => {
     setIsSaving(true);
     try {
-      const res = await fetch(`${getApiBaseUrl()}/api/cases`, {
+      const res = await fetch(`${getApiBaseUrl()}/sags-api/cases`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

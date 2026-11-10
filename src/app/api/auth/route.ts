@@ -1,9 +1,11 @@
 import { NextResponse } from "next/server";
 import {
   authenticateOrRegisterAgent,
+  listCasesForAgent,
   listPublicAgents,
   verifyAgentToken,
 } from "@/lib/case-store";
+import { getTenantBudgetState } from "@/lib/ai-cost-guard";
 
 export async function GET(request: Request) {
   const authHeader = request.headers.get("authorization");
@@ -36,7 +38,10 @@ export async function POST(request: Request) {
       name,
     });
 
-    const response = NextResponse.json({ user, token });
+    const cases = listCasesForAgent(user.email).map(({ profileSnapshot: _, ...summary }) => summary);
+    const budget = getTenantBudgetState("vejle-maegleren");
+
+    const response = NextResponse.json({ user, token, cases, budget });
     response.cookies.set("maegler_token", token, {
       httpOnly: true,
       sameSite: "lax",
@@ -45,9 +50,10 @@ export async function POST(request: Request) {
     });
     return response;
   } catch (error: any) {
+    const isAuthErr = String(error?.message || "").toLowerCase().includes("adgangskode");
     return NextResponse.json(
       { error: error.message || "Fejl ved login" },
-      { status: 500 }
+      { status: isAuthErr ? 401 : 500 }
     );
   }
 }

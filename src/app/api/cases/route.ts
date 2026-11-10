@@ -50,7 +50,16 @@ export async function GET(request: Request) {
     }
   }
 
-  return NextResponse.json(record);
+  const agentCases = listCasesForAgent(record.agentEmail).map(
+    ({ profileSnapshot: _, ...summary }) => summary
+  );
+  const budget = getTenantBudgetState("vejle-maegleren");
+
+  return NextResponse.json({
+    ...record,
+    agentCases,
+    budget,
+  });
 }
 
 export async function POST(request: Request) {
