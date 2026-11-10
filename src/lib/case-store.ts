@@ -249,23 +249,20 @@ export function calculateFloorplanVsBbr(params: {
   let breddeM = Number(params.indvendigBreddeM) || 0;
 
   let indvendigtNettoArealM2 = 0;
-  if (params.rumListe && params.rumListe.length > 0) {
+  if (laengdeM > 0 && breddeM > 0) {
+    indvendigtNettoArealM2 = Number((laengdeM * breddeM).toFixed(1));
+  } else if (params.rumListe && params.rumListe.length > 0) {
     indvendigtNettoArealM2 = Number(
       params.rumListe
         .reduce((sum, r) => sum + (Number(r.laengdeM) || 0) * (Number(r.breddeM) || 0), 0)
         .toFixed(1)
     );
-    if (laengdeM <= 0 || breddeM <= 0) {
-      laengdeM = Number(Math.sqrt(indvendigtNettoArealM2 * 1.45).toFixed(2));
-      breddeM = Number((indvendigtNettoArealM2 / Math.max(1, laengdeM)).toFixed(2));
-    }
+    laengdeM = Number(Math.sqrt(indvendigtNettoArealM2 * 1.45).toFixed(2));
+    breddeM = Number((indvendigtNettoArealM2 / Math.max(1, laengdeM)).toFixed(2));
   } else {
-    if (laengdeM <= 0 || breddeM <= 0) {
-      // Standard indvendigt mål som svarer til ~BBR når intet andet er angivet endnu
-      const estNetto = Math.max(25, bbrM2 * 0.81);
-      laengdeM = Number(Math.sqrt(estNetto * 1.45).toFixed(1));
-      breddeM = Number((estNetto / laengdeM).toFixed(1));
-    }
+    const estNetto = Math.max(25, bbrM2 * 0.81);
+    laengdeM = Number(Math.sqrt(estNetto * 1.45).toFixed(1));
+    breddeM = Number((estNetto / laengdeM).toFixed(1));
     indvendigtNettoArealM2 = Number((laengdeM * breddeM).toFixed(1));
   }
 

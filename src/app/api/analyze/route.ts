@@ -304,9 +304,7 @@ export async function POST(request: Request) {
       const buffer = Buffer.from(arrayBuffer);
       shaParts.push(buffer);
 
-      const utf8Extract = buffer.toString("utf8");
-      const latin1Extract = buffer.toString("latin1");
-      const fileText = utf8Extract.slice(0, 40000) + "\n" + latin1Extract.slice(0, 20000);
+      const fileText = buffer.toString("utf8").slice(0, 50000);
       rawTextsByFile[file.name] = fileText;
       combinedRawText += `\n--- FIL: ${file.name} ---\n` + fileText;
 
