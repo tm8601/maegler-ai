@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import {
+  calculateFloorplanVsBbr,
   deleteCaseById,
   getSellerCase,
   hasSellerCase,
@@ -28,7 +29,6 @@ export async function GET(request: Request) {
   const existsInStore = hasSellerCase(id);
   let record = getSellerCase(id);
 
-  // Hvis mægleren genåbner en gemt sag fra sagslisten, sikrer vi at profilen er gemt og at smart-watcher evt. minder om manglende dokumenter (maks 2 gange totalt!)
   if (reopen && existsInStore) {
     let profile = record.profileSnapshot;
     if (!profile && record.address) {
@@ -65,6 +65,23 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   try {
     const body = await request.json();
+    let floorplanCheck = body.floorplanCheck;
+
+    if (body.floorplanInput) {
+      const fp = body.floorplanInput;
+      floorplanCheck = calculateFloorplanVsBbr({
+        sourceFileName: fp.sourceFileName || "Manuel / Plantegningskontrol (L×B)",
+        indvendigLaengdeM: Number(fp.indvendigLaengdeM) || 0,
+        indvendigBreddeM: Number(fp.indvendigBreddeM) || 0,
+        antalIndervaegge: Number(fp.antalIndervaegge ?? 5),
+        indervaegTykkelseCm: Number(fp.indervaegTykkelseCm ?? 10),
+        ydervaegTykkelseCm: Number(fp.ydervaegTykkelseCm ?? 35),
+        rumListe: fp.rumListe,
+        bbrBoligarealM2: Number(fp.bbrBoligarealM2) || 88,
+        isDetected: true,
+      });
+    }
+
     const record = upsertSellerCase({
       id: body.id,
       agentEmail: body.agentEmail,
@@ -73,12 +90,17 @@ export async function POST(request: Request) {
       sellerName: body.sellerName,
       sellerEmail: body.sellerEmail,
       status: body.status,
+      skipSellerQuestionnaire: body.skipSellerQuestionnaire,
+      disabledQuestionIds: body.disabledQuestionIds,
       renovationLevel: body.renovationLevel,
       aiQuestions: body.aiQuestions,
       generatedAfsnit11Clauses: body.generatedAfsnit11Clauses,
+      afsnit11Items: body.afsnit11Items,
       resolvedFlagIds: body.resolvedFlagIds,
       resolvedReminderIds: body.resolvedReminderIds,
       uploadedDocMeta: body.uploadedDocMeta,
+      documentChecks: body.documentChecks,
+      floorplanCheck,
       assistantMessages: body.assistantMessages,
       analysisReport: body.analysisReport,
     });
@@ -102,7 +124,7 @@ export async function PATCH(request: Request) {
     return NextResponse.json(updated);
   } catch (error: any) {
     return NextResponse.json(
-      { error: error.message || "Kunne ikke gemme besvarelse" },
+      { error: error.message || "Kunne ikke gemme sælgersvar" },
       { status: 500 }
     );
   }
@@ -112,7 +134,7 @@ export async function DELETE(request: Request) {
   const { searchParams } = new URL(request.url);
   const id = searchParams.get("id");
   if (!id) {
-    return NextResponse.json({ error: "Mangler sags-ID" }, { status: 400 });
+    return NextResponse.json({ error: "Mangler id" }, { status: 400 });
   }
   const ok = deleteCaseById(id);
   return NextResponse.json({ deleted: ok });

@@ -26,12 +26,15 @@ import {
   Maximize2,
   Send,
   Paperclip,
-  LogOut,
   UserCheck,
   Briefcase,
   Sparkles,
   Radio,
   RotateCcw,
+  Ruler,
+  ShieldCheck,
+  Plus,
+  RefreshCw,
 } from "lucide-react";
 import { getApiBaseUrl } from "@/lib/api";
 import type {
@@ -43,6 +46,8 @@ import type {
   AgentUser,
   SellerCaseRecord,
   CaseWorkflowStatus,
+  CaseDocumentCheckItem,
+  FloorplanCalculation,
 } from "@/lib/case-store";
 
 interface DawaSuggestion {
@@ -135,7 +140,7 @@ export default function Home() {
   // Kun de 3 renoveringsniveauer i Vurderingsberegneren (Projekt 15 motor)
   const [renovationLevel, setRenovationLevel] = useState<RenovationLevelKey>("mellemrenoveret");
 
-  // Skråfoto & Luftfoto state (starter længere ude fra og forbliver zoomet ud fra alle 4 sider)
+  // Skråfoto & Luftfoto state
   const [visualMode, setVisualMode] = useState<"skraafoto" | "ortofoto" | "streetview">("skraafoto");
   const [skraafotoOrientation, setSkraafotoOrientation] = useState<SkraafotoOrientation>("south");
   const [skraafotoLightbox, setSkraafotoLightbox] = useState(false);
@@ -145,6 +150,15 @@ export default function Home() {
   const [isDraggingOver, setIsDraggingOver] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisResult, setAnalysisResult] = useState<string | null>(null);
+
+  // Plantegnings- & Arealberegner state (LxB med 10 cm indervæg & 35 cm ydervæg mod BBR ±15 %)
+  const [fpLengthM, setFpLengthM] = useState<string>("10.4");
+  const [fpWidthM, setFpWidthM] = useState<string>("6.7");
+  const [fpInnerWalls, setFpInnerWalls] = useState<string>("5");
+  const [isSavingFloorplan, setIsSavingFloorplan] = useState(false);
+
+  // Ny Afsnit 11-klausul input
+  const [newClauseInput, setNewClauseInput] = useState("");
 
   // Mægler-til-AI Sagsassistent state
   const [assistantInput, setAssistantInput] = useState("");
@@ -167,7 +181,7 @@ export default function Home() {
   const [mailStatus, setMailStatus] = useState<{ sent: boolean; url?: string; error?: string } | null>(null);
   const [copiedClauseId, setCopiedClauseId] = useState<string | null>(null);
 
-  // Light-dismiss fallback til <dialog> på browsere uden native closedby="any" (jf. modern-web-guidance light-dismiss-a-dialog)
+  // Light-dismiss fallback til <dialog> på browsere uden native closedby="any"
   useEffect(() => {
     const dialogs = [docRoomDialogRef.current, buyerDialogRef.current, loginDialogRef.current].filter(
       Boolean
@@ -203,11 +217,26 @@ export default function Home() {
     if (record.analysisReport !== undefined) {
       setAnalysisResult(record.analysisReport);
     }
-    if (prof || record.profileSnapshot) {
-      setProfile((prof || record.profileSnapshot)!);
+    const targetProf = prof || record.profileSnapshot;
+    if (targetProf) {
+      setProfile(targetProf);
     }
 
-    // Flet gemte dokument-metadata med lokalt uploadede filer (så objekter med preview-URL bevares ved sagsskift)
+    // Opdatér plantegnings-felter fra sagen eller ud fra BBR-standardmål
+    if (record.floorplanCheck) {
+      setFpLengthM(String(record.floorplanCheck.indvendigLaengdeM));
+      setFpWidthM(String(record.floorplanCheck.indvendigBreddeM));
+      setFpInnerWalls(String(record.floorplanCheck.antalIndervaegge || 5));
+    } else if (targetProf?.bbr?.boligarealM2) {
+      const estNetto = Math.max(25, targetProf.bbr.boligarealM2 * 0.8);
+      const l = Number(Math.sqrt(estNetto * 1.45).toFixed(1));
+      const b = Number((estNetto / l).toFixed(1));
+      setFpLengthM(String(l));
+      setFpWidthM(String(b));
+      setFpInnerWalls("5");
+    }
+
+    // Flet gemte dokument-metadata med lokalt uploadede filer + server-side fil-URL
     setUploadedDocs((prev) => {
       prev.forEach((p) => {
         if (p.objectUrl || p.file) {
@@ -218,12 +247,20 @@ export default function Home() {
       const byName = new Map(prev.map((p) => [p.name, p]));
       const merged: UploadedDocItem[] = [];
       for (const meta of record.uploadedDocMeta || []) {
+        const serverUrl = `${getApiBaseUrl()}/sags-api/files?caseId=${encodeURIComponent(
+          record.id
+        )}&fileId=${encodeURIComponent(meta.id)}`;
         const existingLocal =
           byName.get(meta.name) ||
           sessionFileCacheRef.current.get(`${record.id}:${meta.name}`) ||
           sessionFileCacheRef.current.get(meta.name);
         if (existingLocal) {
-          merged.push({ ...existingLocal, id: meta.id, matchedReminderId: meta.matchedReminderId });
+          merged.push({
+            ...existingLocal,
+            id: meta.id,
+            objectUrl: existingLocal.objectUrl || serverUrl,
+            matchedReminderId: meta.matchedReminderId,
+          });
         } else {
           merged.push({
             id: meta.id,
@@ -231,6 +268,7 @@ export default function Home() {
             sizeKb: meta.sizeKb,
             type: meta.type,
             uploadedAt: meta.uploadedAt,
+            objectUrl: serverUrl,
             matchedReminderId: meta.matchedReminderId,
           });
         }
@@ -357,7 +395,6 @@ export default function Home() {
   // Skift mellem gemte sager i mæglerens sagsliste (inkl. smart dokument-overvågning uden limbo)
   const handleSelectSavedCase = async (savedCase: SellerCaseRecord, agentOverride?: AgentUser) => {
     const activeUser = agentOverride || currentAgent;
-    const targetEmail = agentOverride?.email || savedCase.agentEmail || currentAgent.email;
     setAddress(savedCase.address);
     setSelectedAddress(true);
     setVisualMode("skraafoto");
@@ -515,6 +552,154 @@ export default function Home() {
     }
   };
 
+  const handleCalculateFloorplan = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!activeCase || !profile) return;
+    setIsSavingFloorplan(true);
+    try {
+      const l = parseFloat(fpLengthM.replace(",", ".")) || 10.4;
+      const b = parseFloat(fpWidthM.replace(",", ".")) || 6.7;
+      const walls = parseInt(fpInnerWalls, 10) || 5;
+
+      const res = await fetch(`${getApiBaseUrl()}/sags-api/cases`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: activeCase.id,
+          agentEmail: currentAgent.email,
+          agentName: currentAgent.name,
+          address: profile.adresse,
+          floorplanInput: {
+            sourceFileName:
+              uploadedDocs.find((d) => /plan|tegning/i.test(d.name))?.name ||
+              "Plantegningskontrol (L×B)",
+            indvendigLaengdeM: l,
+            indvendigBreddeM: b,
+            antalIndervaegge: walls,
+            indervaegTykkelseCm: 10,
+            ydervaegTykkelseCm: 35,
+            bbrBoligarealM2: profile.bbr.boligarealM2,
+          },
+        }),
+      });
+      if (res.ok) {
+        const updated: SellerCaseRecord = await res.json();
+        syncCaseToState(updated, profile);
+      }
+    } catch {
+      // Ignore
+    } finally {
+      setIsSavingFloorplan(false);
+    }
+  };
+
+  const handleAddClauseToAfsnit11 = async (clauseText: string) => {
+    const clean = clauseText.trim();
+    if (!clean || !activeCase || !profile) return;
+    const existingList = activeCase.generatedAfsnit11Clauses || [];
+    if (existingList.includes(clean)) return;
+    const nextClauses = [clean, ...existingList];
+    try {
+      const res = await fetch(`${getApiBaseUrl()}/sags-api/cases`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: activeCase.id,
+          agentEmail: currentAgent.email,
+          agentName: currentAgent.name,
+          address: profile.adresse,
+          generatedAfsnit11Clauses: nextClauses,
+        }),
+      });
+      if (res.ok) {
+        const updated: SellerCaseRecord = await res.json();
+        setActiveCase(updated);
+        setNewClauseInput("");
+      }
+    } catch {
+      // Ignore
+    }
+  };
+
+  const handleRemoveClauseFromAfsnit11 = async (clauseText: string) => {
+    if (!activeCase || !profile) return;
+    const nextClauses = (activeCase.generatedAfsnit11Clauses || []).filter((c) => c !== clauseText);
+    const nextItems = (activeCase.afsnit11Items || []).filter((i) => i.tekst !== clauseText);
+    try {
+      const res = await fetch(`${getApiBaseUrl()}/sags-api/cases`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: activeCase.id,
+          agentEmail: currentAgent.email,
+          agentName: currentAgent.name,
+          address: profile.adresse,
+          generatedAfsnit11Clauses: nextClauses,
+          afsnit11Items: nextItems,
+        }),
+      });
+      if (res.ok) {
+        const updated: SellerCaseRecord = await res.json();
+        setActiveCase(updated);
+      }
+    } catch {
+      // Ignore
+    }
+  };
+
+  const handleToggleSkipSellerQuestionnaire = async (skip: boolean) => {
+    if (!activeCase || !profile) return;
+    try {
+      const res = await fetch(`${getApiBaseUrl()}/sags-api/cases`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: activeCase.id,
+          agentEmail: currentAgent.email,
+          agentName: currentAgent.name,
+          address: profile.adresse,
+          skipSellerQuestionnaire: skip,
+        }),
+      });
+      if (res.ok) {
+        const updated: SellerCaseRecord = await res.json();
+        setActiveCase(updated);
+      }
+    } catch {
+      // Ignore
+    }
+  };
+
+  const handleToggleQuestionDisabled = async (qId: string) => {
+    if (!activeCase || !profile) return;
+    const set = new Set(activeCase.disabledQuestionIds || []);
+    if (set.has(qId)) {
+      set.delete(qId);
+    } else {
+      set.add(qId);
+    }
+    const nextDisabled = Array.from(set);
+    try {
+      const res = await fetch(`${getApiBaseUrl()}/sags-api/cases`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: activeCase.id,
+          agentEmail: currentAgent.email,
+          agentName: currentAgent.name,
+          address: profile.adresse,
+          disabledQuestionIds: nextDisabled,
+        }),
+      });
+      if (res.ok) {
+        const updated: SellerCaseRecord = await res.json();
+        setActiveCase(updated);
+      }
+    } catch {
+      // Ignore
+    }
+  };
+
   const getSkraafotoUrlForOrientation = (dir: SkraafotoOrientation): string => {
     if (!profile) return "";
     if (dir === "north") return profile.visuelPakke.skraafotoNordUrl;
@@ -539,14 +724,14 @@ export default function Home() {
     });
   };
 
-  const runAnalysis = async (docsToAnalyze: File[]) => {
+  const runAnalysis = async (filesToAnalyze: File[]) => {
     setIsAnalyzing(true);
     const formData = new FormData();
     formData.append("address", profile?.adresse || address);
     formData.append("agentEmail", currentAgent.email);
     formData.append("agentName", currentAgent.name);
     if (caseId) formData.append("caseId", caseId);
-    docsToAnalyze.forEach((file) => {
+    filesToAnalyze.forEach((file) => {
       formData.append("files", file);
     });
 
@@ -586,7 +771,7 @@ export default function Home() {
     const newItems: UploadedDocItem[] = fileArray.map((file) => {
       const isImage = forceType === "photo" || file.type.startsWith("image/");
       return {
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        id: `doc-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
         file,
         name: file.name,
         sizeKb: Math.max(1, Math.round(file.size / 1024)),
@@ -603,42 +788,9 @@ export default function Home() {
     });
     setUploadedDocs(updated);
 
-    // Gem altid metadata (både fotos og dokumenter) på sagen og opdatér UI-state
-    if (activeCase && profile) {
-      const metaList = updated.map((u) => ({
-        id: u.id,
-        name: u.name,
-        sizeKb: u.sizeKb,
-        type: u.type,
-        uploadedAt: u.uploadedAt,
-        matchedReminderId: u.matchedReminderId || null,
-      }));
-      const saveRes = await fetch(`${getApiBaseUrl()}/sags-api/cases`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          id: activeCase.id,
-          agentEmail: currentAgent.email,
-          agentName: currentAgent.name,
-          address: profile.adresse,
-          uploadedDocMeta: metaList,
-        }),
-      });
-      if (saveRes.ok) {
-        const savedRecord: SellerCaseRecord = await saveRes.json();
-        setActiveCase(savedRecord);
-        setAgentCases((prev) =>
-          prev.map((c) => (c.id === savedRecord.id ? { ...c, ...savedRecord, profileSnapshot: undefined } : c))
-        );
-      }
-    }
-
-    const docFiles = updated
-      .filter((d) => d.type === "document" && d.file)
-      .map((d) => d.file!);
-    if (newItems.some((i) => i.type === "document")) {
-      await runAnalysis(docFiles);
-    }
+    // Kør altid aktiv AI-dokument-, billed- og plantegningskontrol (både ved dokumenter OG fotos/plantegninger!)
+    const allLocalFiles = updated.filter((d) => d.file).map((d) => d.file!);
+    await runAnalysis(allLocalFiles.length > 0 ? allLocalFiles : fileArray);
   };
 
   // Mægler skriver til Sags-AI (eller vedhæfter ekstra bilag til gennemgang)
@@ -656,11 +808,10 @@ export default function Home() {
       formData.append("message", textToSend);
       assistantFiles.forEach((f) => formData.append("files", f));
 
-      // Hvis der var bilag vedhæftet i assistenten, tilføj dem også til lokale objekter så de kan downloades i Dokumentrummet
       if (assistantFiles.length > 0) {
         const nowStr = new Date().toLocaleTimeString("da-DK", { hour: "2-digit", minute: "2-digit" });
         const localAdds: UploadedDocItem[] = assistantFiles.map((file) => ({
-          id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          id: `doc-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
           file,
           name: file.name,
           sizeKb: Math.max(1, Math.round(file.size / 1024)),
@@ -701,6 +852,9 @@ export default function Home() {
     const filtered = uploadedDocs.filter((item) => item.id !== id);
     setUploadedDocs(filtered);
     if (activeCase && profile) {
+      const nextChecks = (activeCase.documentChecks || []).filter(
+        (chk) => !uploadedDocs.some((u) => u.id === id && u.name === chk.fileName)
+      );
       const saveRes = await fetch(`${getApiBaseUrl()}/sags-api/cases`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -717,6 +871,7 @@ export default function Home() {
             uploadedAt: u.uploadedAt,
             matchedReminderId: u.matchedReminderId || null,
           })),
+          documentChecks: nextChecks,
         }),
       });
       if (saveRes.ok) {
@@ -927,48 +1082,9 @@ export default function Home() {
       <div class="card-label">Varmeinstallation (BBR)</div>
       <div class="card-val">${profile.bbr.varmeinstallationTekst}</div>
     </div>
-    <div class="card">
-      <div class="card-label">Værelser / Badeværelser / Etager</div>
-      <div class="card-val">${profile.bbr.antalVaerelser ?? "—"} vær. / ${profile.bbr.antalBadevaerelser ?? "—"} bad / ${profile.bbr.antalEtager} plan</div>
-    </div>
-    <div class="card">
-      <div class="card-label">Gældende Lokalplan (Plandata.dk)</div>
-      <div class="card-val">${profile.plandata.lokalplanId ? `Nr. ${profile.plandata.lokalplanId} (${profile.plandata.lokalplanNavn})` : "Ingen særskilt lokalplan"}</div>
-    </div>
-    <div class="card">
-      <div class="card-label">Off. Ejendomsværdi / Seneste Handel</div>
-      <div class="card-val">
-        ${profile.tingbog.offentligEjendomsvaerdiDkk ? `${profile.tingbog.offentligEjendomsvaerdiDkk.toLocaleString("da-DK")} kr.` : "Se Vurderingsportalen"}
-        ${profile.tingbog.senesteHandelsprisDkk ? ` / ${profile.tingbog.senesteHandelsprisDkk.toLocaleString("da-DK")} kr.` : ""}
-      </div>
-    </div>
   </div>
 
-  ${
-    photos.length > 0
-      ? `<h2>3. Uploadede Billeder af Ejendommen (${photos.length} stk.)</h2>
-      <div class="photos">
-        ${photos.map((p) => `<div><img src="${p.objectUrl}" alt="${p.name}" /><div style="font-size:11px;color:#64748b;margin-top:4px;">${p.name}</div></div>`).join("")}
-      </div>`
-      : ""
-  }
-
-  <h2>${photos.length > 0 ? "4." : "3."} Sekundære Bygninger & BBR-Undertabeller</h2>
-  <p style="font-size:13px;margin:6px 0;">
-    <strong>Sekundære bygninger i BBR:</strong> ${
-      profile.bbr.sekundaereBygninger.length > 0
-        ? profile.bbr.sekundaereBygninger.map((s) => `${s.typeTekst} (${s.arealM2} m², opført ${s.opfoerelsesaar || "ukendt"})`).join(", ")
-        : "Ingen sekundære bygninger registreret i BBR"
-    }<br/>
-    <strong>BBR Tekniske Anlæg:</strong> ${
-      profile.bbr.tekniskeAnlaeg.length > 0
-        ? profile.bbr.tekniskeAnlaeg.map((t) => `${t.typeTekst} (${t.driftstatusTekst})`).join(", ")
-        : "Ingen tanke registreret i BBR_TekniskAnlaeg"
-    }<br/>
-    <strong>Uploadede sagsdokumenter i Dokumentrum:</strong> ${docs.length > 0 ? docs.map((d) => d.name).join(", ") : "Ingen dokumenter uploadet endnu"}
-  </p>
-
-  <h2>${photos.length > 0 ? "5." : "4."} Klausuler til Købsaftalens Afsnit 11</h2>
+  <h2>3. Klausuler til Købsaftalens Afsnit 11</h2>
   ${activeClauses.map((txt) => `<div class="clause">"${txt}"</div>`).join("")}
 </body>
 </html>`;
@@ -1020,7 +1136,9 @@ export default function Home() {
           caseId,
           agentEmail: currentAgent.email,
           agentName: currentAgent.name,
-          aiQuestions: profile?.saelgerSpoergsmaal || [],
+          aiQuestions: (profile?.saelgerSpoergsmaal || []).filter(
+            (q) => !(activeCase?.disabledQuestionIds || []).includes(q.id)
+          ),
           generatedAfsnit11Clauses:
             activeCase?.generatedAfsnit11Clauses ||
             profile?.afsnit11Klausuler.map((k) => k.tekst) ||
@@ -1104,23 +1222,130 @@ export default function Home() {
     return activeValuation.estimatDkk <= buyer.maksBudgetDkk;
   });
 
-  const missingRemindersCount = (profile?.paamindelseDokumenter || []).filter(
-    (r) => !isReminderDocUploaded(r.id)
-  ).length;
-
   const resolvedFlagsSet = new Set(activeCase?.resolvedFlagIds || []);
   const activeClausesList =
     activeCase?.generatedAfsnit11Clauses && activeCase.generatedAfsnit11Clauses.length > 0
       ? activeCase.generatedAfsnit11Clauses
       : profile?.afsnit11Klausuler.map((k) => k.tekst) || [];
 
+  const structuredAfsnit11 =
+    activeCase?.afsnit11Items && activeCase.afsnit11Items.length > 0
+      ? activeCase.afsnit11Items
+      : activeClausesList.map((txt, idx) => ({
+          id: `cl-${idx}`,
+          titel: "Forbehold til Købsaftalens Afsnit 11",
+          kilde: "BBR / Registerkontrol",
+          tekst: txt,
+          prioritet: "anbefalet" as const,
+          godkendtAfMaegler: true,
+        }));
+
+  const documentChecks: CaseDocumentCheckItem[] = activeCase?.documentChecks || [];
+  const floorplanCheck: FloorplanCalculation | null = activeCase?.floorplanCheck || null;
+
+  // Live LxB forhåndsberegning i UI (10 cm indervægge, 35 cm ydervægge mod BBR ±15 %)
+  const liveBbrM2 = profile?.bbr?.boligarealM2 || 88;
+  const liveLm = parseFloat(fpLengthM.replace(",", ".")) || 10.4;
+  const liveBm = parseFloat(fpWidthM.replace(",", ".")) || 6.7;
+  const liveWalls = parseInt(fpInnerWalls, 10) || 5;
+  const liveNettoM2 = Number((liveLm * liveBm).toFixed(1));
+  const liveInnerWallAddM2 = Number((liveWalls * Math.max(2.5, liveBm * 0.65) * 0.1).toFixed(1));
+  const liveOuterWallAddM2 = Number((2 * (liveLm + liveBm) * 0.35 + 4 * 0.35 * 0.35).toFixed(1));
+  const liveBruttoM2 = Math.round(liveNettoM2 + liveInnerWallAddM2 + liveOuterWallAddM2);
+  const liveDiffM2 = liveBruttoM2 - liveBbrM2;
+  const liveDiffPct = Number(((liveDiffM2 / Math.max(1, liveBbrM2)) * 100).toFixed(1));
+  const liveWithin15Pct = Math.abs(liveDiffPct) <= 15.0;
+
+  // Opmærksomhedspunkter (Alt hvad mægler SKAL være opmærksom på øverst)
+  const unresolvedRegisterFlags = (profile?.roedeFlag || []).filter((f) => !resolvedFlagsSet.has(f.id));
+  const attentionDocChecks = documentChecks.filter((d) => d.status !== "ok");
+  const missingCoreDocs = (profile?.paamindelseDokumenter || []).filter((r) => !isReminderDocUploaded(r.id));
+
+  // Kontrollerede og godkendte punkter (Nederst – mægler behøver ikke foretage sig mere)
+  const verifiedItemsBottom: Array<{ label: string; detail: string; source: string }> = [];
+  if (profile) {
+    verifiedItemsBottom.push({
+      label: "BBR Hovedbygning & Klimaskærm",
+      detail: `${profile.bbr.boligarealM2} m² bolig · Opført ${profile.bbr.opfoerelsesaar ?? "—"} · ${profile.bbr.tagmaterialeTekst} · ${profile.bbr.ydervaegTekst}`,
+      source: "BBR/v3",
+    });
+    if (profile.bbr.tekniskeAnlaeg.length === 0) {
+      verifiedItemsBottom.push({
+        label: "Olietanke & Tekniske Anlæg",
+        detail: "Ingen aktive eller uafklarede olietanke registreret i BBR_TekniskAnlaeg",
+        source: "BBR_TekniskAnlaeg",
+      });
+    }
+    if (profile.bbr.byggesager.filter((b) => b.erAabenUdenIbrugtagning).length === 0) {
+      verifiedItemsBottom.push({
+        label: "Åbne Byggesager i BBR",
+        detail: "Ingen uafsluttede byggesager registreret i BBR_Byggesag",
+        source: "BBR_Byggesag",
+      });
+    }
+    verifiedItemsBottom.push({
+      label: "Matrikel & Skel",
+      detail: `Matr.nr. ${profile.matrikel.matrikelnummer} (${profile.matrikel.ejerlavsnavn}) · ${profile.matrikel.registreretArealM2} m² grundareal`,
+      source: "MAT/v2",
+    });
+    if (profile.matrikel.fredskovArealM2 === 0 && profile.matrikel.strandbeskyttelseArealM2 === 0) {
+      verifiedItemsBottom.push({
+        label: "Fredskov & Strandbeskyttelse",
+        detail: "0 m² fredskov · 0 m² strandbeskyttelseslinje · 0 m² klitfredning",
+        source: "MAT/v2",
+      });
+    }
+    if (!profile.matrikel.jordforureningStatus.toLowerCase().includes("v1") || profile.matrikel.jordforureningStatus.toLowerCase().includes("ingen")) {
+      verifiedItemsBottom.push({
+        label: "Jordforurening (V1 / V2)",
+        detail: profile.matrikel.jordforureningStatus || "Ingen registreret V1/V2 jordforurening på matriklen",
+        source: "Miljø / MAT",
+      });
+    }
+    if (profile.plandata.faktiskBebyggelsesprocent <= profile.plandata.tilladtBebyggelsesprocent) {
+      verifiedItemsBottom.push({
+        label: "Bebyggelsesprocent & Zonestatus",
+        detail: `${profile.plandata.faktiskBebyggelsesprocent}% udnyttet (maks. ${profile.plandata.tilladtBebyggelsesprocent}%) · ${profile.plandata.zonestatus}`,
+        source: "Plandata.dk",
+      });
+    }
+    if (profile.cvr.registreredeVirksomheder.length === 0) {
+      verifiedItemsBottom.push({
+        label: "CVR & Erhverv på adressen",
+        detail: "Ingen aktive selskaber eller erhvervslejemål registreret på adressen",
+        source: "CVR",
+      });
+    }
+    if (liveWithin15Pct) {
+      verifiedItemsBottom.push({
+        label: "Plantegnings-tolerance (±15 % mod BBR)",
+        detail: `Beregnet brutto ${liveBruttoM2} m² (inkl. 10 cm indervæg / 35 cm ydervæg) mod BBR ${liveBbrM2} m² (${liveDiffPct > 0 ? "+" : ""}${liveDiffPct} %)`,
+        source: "Plantegning L×B",
+      });
+    }
+    for (const rf of profile.roedeFlag.filter((f) => resolvedFlagsSet.has(f.id))) {
+      verifiedItemsBottom.push({
+        label: `Afklaret af mægler: ${rf.title}`,
+        detail: rf.description,
+        source: rf.register,
+      });
+    }
+    for (const dc of documentChecks.filter((d) => d.status === "ok")) {
+      verifiedItemsBottom.push({
+        label: `Tjekket uden anmærkninger: ${dc.fileName}`,
+        detail: dc.fundOverskrift,
+        source: dc.kategori,
+      });
+    }
+  }
+
   const workflowMeta =
     WORKFLOW_STATUS_LABELS[activeCase?.workflowStatus || "afventer_dokumenter"];
 
   return (
-    <div className="min-h-screen bg-[#f8fafc] py-5 px-4 sm:px-6 lg:px-8 font-sans text-slate-900">
+    <div className="min-h-screen bg-[#f8fafc] py-4 px-4 sm:px-6 lg:px-8 font-sans text-slate-900">
       <div className="max-w-6xl mx-auto space-y-4">
-        {/* MINIMALISTISK 2026 TOPBAR MED MÆGLER-LOGIN & DISKRET LIVE-INDIKATOR */}
+        {/* TOPBAR MED MÆGLER-LOGIN & DISKRET LIVE-INDIKATOR */}
         <header className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white rounded-2xl px-5 py-3 border border-slate-200/80 shadow-xs">
           <div className="flex items-center gap-3">
             <div className="w-8 h-8 rounded-xl bg-slate-900 text-white flex items-center justify-center font-bold text-xs tracking-tight">
@@ -1129,7 +1354,6 @@ export default function Home() {
             <div>
               <div className="flex items-center gap-2">
                 <h1 className="font-bold text-sm text-slate-900 leading-tight">Vejle Mægleren</h1>
-                {/* Meget diskret live-indikator (uden teknisk forklaring) */}
                 <span
                   className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-50 border border-slate-200/70 text-[10px] font-medium text-slate-500"
                   aria-label="Live status"
@@ -1139,13 +1363,12 @@ export default function Home() {
                 </span>
               </div>
               <p className="text-[11px] text-slate-500">
-                Ejendomsdata · Vurderingsberegner · Sagsstyring
+                Ejendomsdata · Dokument- & Billedkontrol · Afsnit 11
               </p>
             </div>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            {/* Mægler Login / Skift mægler knap */}
             <button
               type="button"
               onClick={() => loginDialogRef.current?.showModal()}
@@ -1158,7 +1381,6 @@ export default function Home() {
               <span className="text-[10px] text-slate-400">Skift</span>
             </button>
 
-            {/* Køberkartotek gemt væk bag en knap */}
             <button
               type="button"
               onClick={openBuyerModal}
@@ -1178,7 +1400,7 @@ export default function Home() {
               className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white hover:bg-slate-50 text-slate-800 border border-slate-200 text-xs font-semibold transition-colors cursor-pointer"
             >
               <FolderOpen size={14} className="text-blue-600" />
-              <span>Hent dokumenter</span>
+              <span>Dokumentrum</span>
               <span className="px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 text-[10px] font-bold">
                 {totalDocumentsInRoom}
               </span>
@@ -1196,43 +1418,50 @@ export default function Home() {
           </div>
         </header>
 
-        {/* MÆGLERENS PERSONLIGE SAGSLISTE ("MINE SAGER" – GÅ FREM OG TILBAGE MELLEM SAGER MED KOMPAKT DETALJE-TEKST) */}
-        <section className="bg-white rounded-2xl px-4 py-3 border border-slate-200/80 shadow-xs">
-          <div className="flex items-center justify-between gap-2 mb-2">
+        {/* MINE SAGER + ADRESSEOPSLAG KOMPAKT SAMLET */}
+        <section className="bg-white rounded-2xl p-4 border border-slate-200/80 shadow-xs space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2">
               <Briefcase size={13} className="text-slate-500" />
               <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
                 Mine Sager · {currentAgent.name} ({agentCases.length})
               </span>
             </div>
-            <span className="text-[11px] text-slate-400">
-              Klik på en sag for at gå frem og tilbage og se status
-            </span>
+            {isLoadingProfile || isSearching ? (
+              <span className="text-xs text-blue-600 font-medium animate-pulse">
+                Henter BBR, Matrikel, Plandata & Skråfoto...
+              </span>
+            ) : (
+              selectedAddress &&
+              profile && (
+                <span className="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-700">
+                  <CheckCircle2 size={13} />
+                  BFE {profile.bbr.bfeNummer} · Matr. {profile.matrikel.matrikelnummer} ({profile.matrikel.ejerlavsnavn})
+                </span>
+              )
+            )}
           </div>
 
           <div className="flex items-center gap-2 overflow-x-auto pb-1">
             {agentCases.map((c) => {
               const isCurrent = c.id === caseId || c.address === profile?.adresse;
               const wf = WORKFLOW_STATUS_LABELS[c.workflowStatus || "afventer_dokumenter"];
-              const resolvedCount = (c.resolvedReminderIds || []).length;
               return (
                 <div
                   key={c.id}
                   onClick={() => handleSelectSavedCase(c)}
-                  className={`group flex-shrink-0 rounded-xl px-3 py-2 border transition-all cursor-pointer min-w-[230px] max-w-[270px] ${
+                  className={`group flex-shrink-0 rounded-xl px-3 py-1.5 border transition-all cursor-pointer min-w-[215px] max-w-[255px] ${
                     isCurrent
                       ? "border-slate-900 bg-slate-900 text-white shadow-xs"
                       : "border-slate-200 bg-slate-50/60 hover:bg-white hover:border-slate-300 text-slate-800"
                   }`}
                 >
-                  <div className="flex items-center justify-between gap-2 mb-1">
+                  <div className="flex items-center justify-between gap-2">
                     <span className="font-bold text-xs truncate">{c.address.split(",")[0]}</span>
                     <div className="flex items-center gap-1 flex-shrink-0">
                       <span
                         className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${
-                          isCurrent
-                            ? "bg-white/15 text-white border-white/20"
-                            : wf.badgeClass
+                          isCurrent ? "bg-white/15 text-white border-white/20" : wf.badgeClass
                         }`}
                       >
                         {wf.label}
@@ -1252,22 +1481,21 @@ export default function Home() {
                     </div>
                   </div>
                   <div
-                    className={`flex items-center justify-between text-[11px] ${
+                    className={`flex items-center justify-between text-[10px] mt-0.5 ${
                       isCurrent ? "text-slate-300" : "text-slate-500"
                     }`}
                   >
                     <span>
-                      {c.boligarealM2 || "—"} m² · {c.grundarealM2 || "—"} m² grund
+                      {c.boligarealM2 || "—"} m² · {c.grundarealM2 || "—"} m²
                     </span>
                     <span className="font-semibold">
-                      {c.valuationDkk ? `${(c.valuationDkk / 1e6).toFixed(2).replace(".", ",")} mio.` : `${resolvedCount}/3 dok.`}
+                      {c.valuationDkk ? `${(c.valuationDkk / 1e6).toFixed(2).replace(".", ",")} mio.` : ""}
                     </span>
                   </div>
                 </div>
               );
             })}
 
-            {/* Hurtigknapper til øvrige Vejle-sager hvis mægleren vil åbne en ny sag hurtigt */}
             {[
               "H C Hansens Vej 29, 7100 Vejle",
               "Kløvertoften 38, 7100 Vejle",
@@ -1284,39 +1512,20 @@ export default function Home() {
                       adresse: { id: "", href: "" },
                     })
                   }
-                  className="flex-shrink-0 px-3 py-2 rounded-xl border border-dashed border-slate-200 hover:border-slate-400 text-left text-xs text-slate-500 hover:text-slate-800 transition-colors cursor-pointer"
+                  className="flex-shrink-0 px-3 py-1.5 rounded-xl border border-dashed border-slate-200 hover:border-slate-400 text-left text-xs text-slate-500 hover:text-slate-800 transition-colors cursor-pointer"
                 >
                   <span className="block font-semibold text-[11px]">+ {sample.split(",")[0]}</span>
                   <span className="text-[10px] text-slate-400">Åbn som ny sag</span>
                 </button>
               ))}
           </div>
-        </section>
-
-        {/* ADRESSEOPSLAG (PRÆCIS SOM PROJEKT 10 TAGBEREGNER) */}
-        <section className="bg-white rounded-2xl p-4 border border-slate-200/80 shadow-xs">
-          <div className="flex items-center justify-between mb-1.5">
-            <label htmlFor="property-address-search" className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
-              Slå adresse op eller tilføj ny sag til din sagsliste
-            </label>
-            {isLoadingProfile || isSearching ? (
-              <span className="text-xs text-blue-600 font-medium animate-pulse">
-                Henter BBR, Matrikel, Plandata & Skråfoto...
-              </span>
-            ) : (
-              selectedAddress &&
-              profile && (
-                <span className="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-700">
-                  <CheckCircle2 size={13} />
-                  BFE {profile.bbr.bfeNummer} · Matr. {profile.matrikel.matrikelnummer} ({profile.matrikel.ejerlavsnavn})
-                </span>
-              )
-            )}
-          </div>
 
           <div className="relative" ref={wrapperRef}>
-            <div className="flex items-center border border-slate-200 rounded-xl px-3.5 py-2.5 bg-slate-50/50 focus-within:bg-white focus-within:border-slate-900 transition-all">
-              <Search className="text-slate-400 mr-2.5 flex-shrink-0" size={17} />
+            <div className="flex items-center border border-slate-200 rounded-xl px-3.5 py-2 bg-slate-50/50 focus-within:bg-white focus-within:border-slate-900 transition-all">
+              <Search className="text-slate-400 mr-2.5 flex-shrink-0" size={16} />
+              <label htmlFor="property-address-search" className="sr-only">
+                Slå adresse op
+              </label>
               <input
                 id="property-address-search"
                 name="address-search"
@@ -1363,12 +1572,11 @@ export default function Home() {
           </div>
         </section>
 
-        {/* TOP-SEKTION SOM I PROJEKT 10 TAGBEREGNER: LUFTFOTO/SKRÅFOTO HØJERE OPPE (2/3) + KOMPLETTE EJENDOMSDATA BBR (1/3) */}
+        {/* SKRÅFOTO / LUFTFOTO (2/3) + BBR EJENDOMSDATA (1/3) */}
         {selectedAddress && profile && (
-          <section className="grid grid-cols-1 md:grid-cols-3 gap-5 items-stretch">
-            {/* VENSTRE (2/3): SKRÅFOTO & LUFTFOTO VIEWER (STARTER LÆNGERE UDE FRA OG FORBLIVER LÆNGERE UDE FRA ALLE 4 SIDER) */}
+          <section className="grid grid-cols-1 md:grid-cols-3 gap-4 items-stretch">
             <div className="md:col-span-2">
-              <div className="bg-white rounded-2xl overflow-hidden border border-slate-200/80 shadow-xs h-[390px] relative group">
+              <div className="bg-white rounded-2xl overflow-hidden border border-slate-200/80 shadow-xs h-[370px] relative group">
                 <div
                   className="absolute top-3 left-3 right-3 z-20 flex flex-wrap items-center justify-between gap-2 pointer-events-none"
                   onClick={(e) => e.stopPropagation()}
@@ -1385,9 +1593,7 @@ export default function Home() {
                             setSkraafotoOrientation(dir);
                           }}
                           className={`px-2.5 py-1 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
-                            active
-                              ? "bg-slate-900 text-white"
-                              : "text-slate-700 hover:bg-slate-100"
+                            active ? "bg-slate-900 text-white" : "text-slate-700 hover:bg-slate-100"
                           }`}
                         >
                           {ORIENTATION_LABELS[dir]}
@@ -1398,9 +1604,7 @@ export default function Home() {
                       type="button"
                       onClick={() => setVisualMode("ortofoto")}
                       className={`px-2.5 py-1 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
-                        visualMode === "ortofoto"
-                          ? "bg-slate-900 text-white"
-                          : "text-slate-700 hover:bg-slate-100"
+                        visualMode === "ortofoto" ? "bg-slate-900 text-white" : "text-slate-700 hover:bg-slate-100"
                       }`}
                     >
                       Luftfoto
@@ -1409,9 +1613,7 @@ export default function Home() {
                       type="button"
                       onClick={() => setVisualMode("streetview")}
                       className={`px-2.5 py-1 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
-                        visualMode === "streetview"
-                          ? "bg-slate-900 text-white"
-                          : "text-slate-700 hover:bg-slate-100"
+                        visualMode === "streetview" ? "bg-slate-900 text-white" : "text-slate-700 hover:bg-slate-100"
                       }`}
                     >
                       Gadefoto
@@ -1488,10 +1690,9 @@ export default function Home() {
               </div>
             </div>
 
-            {/* HØJRE (1/3): EJENDOMSDATA (BBR, MATRIKEL & PLANDATA) – KOMPAKT TEKST SÅ ALLE DETALJER ER SYNLIGE UDEN MANGLENDE FELTER */}
             <div className="md:col-span-1">
-              <div className="bg-white rounded-2xl p-4 border border-slate-200/80 shadow-xs h-[390px] flex flex-col">
-                <div className="flex items-center justify-between pb-2.5 mb-2.5 border-b border-slate-100 flex-shrink-0">
+              <div className="bg-white rounded-2xl p-4 border border-slate-200/80 shadow-xs h-[370px] flex flex-col">
+                <div className="flex items-center justify-between pb-2 mb-2 border-b border-slate-100 flex-shrink-0">
                   <div>
                     <h2 className="text-sm font-bold text-slate-900">Ejendomsdata (BBR & Matrikel)</h2>
                     <p className="text-[11px] text-slate-500">
@@ -1503,31 +1704,17 @@ export default function Home() {
                   </span>
                 </div>
 
-                <div className="flex flex-col gap-2 text-xs overflow-y-auto pr-1">
-                  <div
-                    className={
-                      profile.bbr.asbestMistanke
-                        ? "bg-amber-50 border border-amber-200 px-2.5 py-1.5 rounded-lg"
-                        : "bg-slate-50/70 px-2.5 py-1.5 rounded-lg border border-slate-100"
-                    }
-                  >
-                    <span
-                      className={`block text-[10px] uppercase tracking-wider font-semibold ${
-                        profile.bbr.asbestMistanke ? "text-amber-800" : "text-slate-500"
-                      }`}
-                    >
+                <div className="flex flex-col gap-1.5 text-xs overflow-y-auto pr-1">
+                  <div className="bg-slate-50/70 px-2.5 py-1.5 rounded-lg border border-slate-100">
+                    <span className="block text-[10px] uppercase tracking-wider font-semibold text-slate-500">
                       BBR Tag & Ydervæg:
                     </span>
-                    <span
-                      className={`font-semibold text-xs ${
-                        profile.bbr.asbestMistanke ? "text-amber-950" : "text-slate-900"
-                      }`}
-                    >
+                    <span className="font-semibold text-xs text-slate-900">
                       {profile.bbr.tagmaterialeTekst} · {profile.bbr.ydervaegTekst}
                     </span>
                   </div>
 
-                  <div className="grid grid-cols-2 gap-2">
+                  <div className="grid grid-cols-2 gap-1.5">
                     <div className="bg-slate-50/70 px-2.5 py-1.5 rounded-lg border border-slate-100">
                       <span className="text-slate-500 block text-[10px]">Boligareal / Plan:</span>
                       <span className="font-bold text-slate-900">
@@ -1542,14 +1729,12 @@ export default function Home() {
                     </div>
                   </div>
 
-                  <div className="grid grid-cols-2 gap-2">
+                  <div className="grid grid-cols-2 gap-1.5">
                     <div className="bg-slate-50/70 px-2.5 py-1.5 rounded-lg border border-slate-100">
                       <span className="text-slate-500 block text-[10px]">
                         Grund (Matr. {profile.matrikel.matrikelnummer}):
                       </span>
-                      <span className="font-bold text-slate-900">
-                        {profile.matrikel.registreretArealM2} m²
-                      </span>
+                      <span className="font-bold text-slate-900">{profile.matrikel.registreretArealM2} m²</span>
                     </div>
                     <div className="bg-slate-50/70 px-2.5 py-1.5 rounded-lg border border-slate-100">
                       <span className="text-slate-500 block text-[10px]">Opført / Ombygget:</span>
@@ -1560,12 +1745,11 @@ export default function Home() {
                     </div>
                   </div>
 
-                  <div className="grid grid-cols-2 gap-2">
+                  <div className="grid grid-cols-2 gap-1.5">
                     <div className="bg-slate-50/70 px-2.5 py-1.5 rounded-lg border border-slate-100">
                       <span className="text-slate-500 block text-[10px]">Værelser / Bad / Toilet:</span>
                       <span className="font-bold text-slate-900">
-                        {profile.bbr.antalVaerelser ?? "—"} vær · {profile.bbr.antalBadevaerelser ?? "—"} bad ·{" "}
-                        {profile.bbr.antalToiletter ?? profile.bbr.antalBadevaerelser ?? "—"} toil.
+                        {profile.bbr.antalVaerelser ?? "—"} vær · {profile.bbr.antalBadevaerelser ?? "—"} bad
                       </span>
                     </div>
                     <div className="bg-slate-50/70 px-2.5 py-1.5 rounded-lg border border-slate-100">
@@ -1584,17 +1768,14 @@ export default function Home() {
                   </div>
 
                   <div className="bg-slate-50/70 px-2.5 py-1.5 rounded-lg border border-slate-100">
-                    <span className="text-slate-500 block text-[10px]">Sekundære bygninger & Lokalplan:</span>
+                    <span className="text-slate-500 block text-[10px]">Sekundære bygninger & Plandata:</span>
                     <span className="font-semibold text-slate-900">
                       {profile.bbr.sekundaereBygninger.length > 0
                         ? profile.bbr.sekundaereBygninger
                             .map((s) => `${s.typeTekst} (${s.arealM2} m²)`)
                             .join(", ")
                         : "Ingen sekundære bygninger"}{" "}
-                      ·{" "}
-                      {profile.plandata.lokalplanId
-                        ? `Lokalplan ${profile.plandata.lokalplanId}`
-                        : profile.plandata.zonestatus}
+                      · {profile.plandata.zonestatus}
                     </span>
                   </div>
                 </div>
@@ -1603,15 +1784,620 @@ export default function Home() {
           </section>
         )}
 
-        {/* VURDERINGSBEREGNER (PROJEKT 15) – KUN 3 RENOVERINGSNIVEAUER + UPLOAD BILLEDER + DOWNLOAD */}
+        {/* 1. OVERSIGT OVER DET MÆGLER SKAL VÆRE OPMÆRKSOM PÅ (FREMTRÆDENDE ØVERST) */}
         {selectedAddress && profile && (
-          <section className="bg-white rounded-2xl p-5 border border-slate-200/80 shadow-xs">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
+          <section className="bg-white rounded-2xl p-4 border-2 border-amber-300/90 shadow-xs">
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+              <div className="flex items-center gap-2">
+                <span className="w-6 h-6 rounded-lg bg-amber-100 text-amber-800 flex items-center justify-center font-bold text-xs">
+                  <AlertTriangle size={14} />
+                </span>
+                <div>
+                  <h2 className="text-sm font-bold text-slate-900">
+                    Mæglerens Opmærksomhedspunkter (Kræver opmærksomhed / afklaring)
+                  </h2>
+                  <p className="text-[11px] text-slate-500">
+                    Her samles kun forhold der kræver din stillingtagen, dokumentation eller Afsnit 11-forbehold. Når et punkt markeres som afklaret, flyttes det ned i den grønne oversigt nederst.
+                  </p>
+                </div>
+              </div>
+              <span className="px-2.5 py-1 rounded-full bg-amber-50 border border-amber-200 text-amber-900 text-xs font-bold">
+                {unresolvedRegisterFlags.length +
+                  attentionDocChecks.length +
+                  (!liveWithin15Pct ? 1 : 0) +
+                  missingCoreDocs.length}{" "}
+                aktive punkter
+              </span>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+              {/* A. Plantegnings-afvigelse hvis > 15 % */}
+              {!liveWithin15Pct && (
+                <div className="p-3 rounded-xl border border-red-200 bg-red-50/60 flex flex-col justify-between gap-2">
+                  <div>
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-red-100 text-red-800">
+                        KRITISK · PLANTEGNING L×B (&gt; 15 %)
+                      </span>
+                      <span className="text-[11px] font-bold text-red-700">
+                        {liveDiffPct > 0 ? `+${liveDiffPct}` : liveDiffPct} % afvigelse
+                      </span>
+                    </div>
+                    <h3 className="text-xs font-bold text-slate-900 mt-1">
+                      Plantegning ({liveBruttoM2} m² brutto) afviger mere end 15 % fra BBR ({liveBbrM2} m²)
+                    </h3>
+                    <p className="text-[11px] text-slate-700 mt-0.5">
+                      Indvendige mål ({liveLm} × {liveBm} m = {liveNettoM2} m²) + 10 cm indervægge ({liveInnerWallAddM2} m²) + 35 cm ydervægge ({liveOuterWallAddM2} m²) giver {liveBruttoM2} m² mod BBR {liveBbrM2} m².
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleAddClauseToAfsnit11(
+                          `Ved kontrolopmåling af plantegning (indvendige mål ${liveLm} × ${liveBm} m korrigeret for 10 cm indervægge og 35 cm ydervægge) er det beregnede bruttoareal opgjort til ca. ${liveBruttoM2} m² mod det i BBR registrerede boligareal på ${liveBbrM2} m² (afvigelse på ${liveDiffPct} %). Køber er gjort udtrykkeligt opmærksom på arealafvigelsen og kan ikke rette krav mod sælger eller medvirkende ejendomsmægler.`
+                        )
+                      }
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-[11px] font-semibold cursor-pointer"
+                    >
+                      <Plus size={11} /> Tilføj til Afsnit 11
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* B. Aktive BBR / Matrikel / Plandata observanda */}
+              {unresolvedRegisterFlags.map((flag) => (
+                <div
+                  key={flag.id}
+                  className={`p-3 rounded-xl border flex flex-col justify-between gap-2 ${
+                    flag.severity === "kritisk"
+                      ? "border-red-200 bg-red-50/50"
+                      : "border-amber-200 bg-amber-50/40"
+                  }`}
+                >
+                  <div>
+                    <div className="flex items-center justify-between gap-2">
+                      <span
+                        className={`text-[10px] font-bold px-2 py-0.5 rounded ${
+                          flag.severity === "kritisk"
+                            ? "bg-red-100 text-red-800"
+                            : "bg-amber-100 text-amber-900"
+                        }`}
+                      >
+                        {flag.register} · {flag.severity === "kritisk" ? "Kritisk" : "Observandum"}
+                      </span>
+                    </div>
+                    <h3 className="text-xs font-bold text-slate-900 mt-1">{flag.title}</h3>
+                    <p className="text-[11px] text-slate-700 mt-0.5">{flag.description}</p>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                    {flag.afsnit11Clause && (
+                      <button
+                        type="button"
+                        onClick={() => handleAddClauseToAfsnit11(flag.afsnit11Clause!)}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-[10px] font-semibold cursor-pointer"
+                      >
+                        <Plus size={11} /> Tilføj til Afsnit 11
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => handleToggleFlagResolved(flag.id)}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white hover:bg-emerald-50 text-slate-700 hover:text-emerald-800 border border-slate-200 text-[10px] font-semibold cursor-pointer"
+                    >
+                      <Check size={11} /> Markér som afklaret
+                    </button>
+                  </div>
+                </div>
+              ))}
+
+              {/* C. Fund fra aktiv dokument- og billedkontrol med opmærksomhed/afvigelse */}
+              {attentionDocChecks.map((chk) => (
+                <div
+                  key={chk.id}
+                  className="p-3 rounded-xl border border-amber-200 bg-amber-50/40 flex flex-col justify-between gap-2"
+                >
+                  <div>
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-blue-100 text-blue-900">
+                        DOKUMENT-/BILLEDTJEK · {chk.fileName}
+                      </span>
+                    </div>
+                    <h3 className="text-xs font-bold text-slate-900 mt-1">{chk.fundOverskrift}</h3>
+                    <ul className="text-[11px] text-slate-700 mt-1 space-y-0.5 list-disc list-inside">
+                      {chk.fundDetaljer.map((d, idx) => (
+                        <li key={idx}>{d}</li>
+                      ))}
+                    </ul>
+                  </div>
+                  {chk.afsnit11Forslag && (
+                    <div className="flex items-center gap-1.5 pt-1">
+                      <button
+                        type="button"
+                        onClick={() => handleAddClauseToAfsnit11(chk.afsnit11Forslag!)}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-[10px] font-semibold cursor-pointer"
+                      >
+                        <Plus size={11} /> Tilføj forbehold til Afsnit 11
+                      </button>
+                    </div>
+                  )}
+                </div>
+              ))}
+
+              {/* D. Manglende kernebilag */}
+              {missingCoreDocs.map((rem) => (
+                <div
+                  key={rem.id}
+                  className="p-3 rounded-xl border border-slate-200 bg-slate-50/70 flex items-center justify-between gap-3"
+                >
+                  <div>
+                    <span className="text-[10px] font-bold uppercase text-amber-700 block">
+                      Mangler dokument ({rem.vigtighed})
+                    </span>
+                    <h3 className="text-xs font-bold text-slate-900">{rem.titel}</h3>
+                    <p className="text-[11px] text-slate-500">{rem.beskrivelse}</p>
+                  </div>
+                  <div className="flex items-center gap-1.5 flex-shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => docInputRef.current?.click()}
+                      className="px-2.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-[11px] font-semibold cursor-pointer"
+                    >
+                      Upload
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleToggleReminderResolved(rem.id)}
+                      className="px-2.5 py-1.5 rounded-lg bg-white hover:bg-emerald-50 text-slate-700 border border-slate-200 text-[11px] font-semibold cursor-pointer"
+                      title="Markér som modtaget/afklaret"
+                    >
+                      ✓ Modtaget
+                    </button>
+                  </div>
+                </div>
+              ))}
+
+              {unresolvedRegisterFlags.length === 0 &&
+                attentionDocChecks.length === 0 &&
+                liveWithin15Pct &&
+                missingCoreDocs.length === 0 && (
+                  <div className="md:col-span-2 p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-xs font-medium flex items-center gap-2">
+                    <CheckCircle2 size={16} className="text-emerald-600 flex-shrink-0" />
+                    <span>
+                      Alle opmærksomhedspunkter og kernedokumenter på sagen er afklaret. Se de færdige Afsnit 11-klausuler nedenfor.
+                    </span>
+                  </div>
+                )}
+            </div>
+          </section>
+        )}
+
+        {/* 2. AKTIV DOKUMENT-, BILLED- & PLANTEGNINGSKONTROL (VENSTRE) + FREMTRÆDENDE FORSLAG TIL KØBSAFTALENS AFSNIT 11 (HØJRE) */}
+        {selectedAddress && profile && (
+          <section
+            onDragOver={(e) => {
+              e.preventDefault();
+              setIsDraggingOver(true);
+            }}
+            onDragLeave={() => setIsDraggingOver(false)}
+            onDrop={(e) => {
+              e.preventDefault();
+              setIsDraggingOver(false);
+              if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                addFilesToCase(e.dataTransfer.files);
+              }
+            }}
+            className={`grid grid-cols-1 lg:grid-cols-12 gap-4 items-start ${
+              isDraggingOver ? "ring-2 ring-blue-500 rounded-2xl" : ""
+            }`}
+          >
+            {/* VENSTRE (6/12): KOMPAKT KERNE-DOKUMENTLISTE + AKTIV BILLED- & PLANTEGNINGSKONTROL (LxB MOD BBR ±15 %) */}
+            <div className="lg:col-span-6 space-y-4">
+              {/* A. KOMPAKT DOKUMENTLISTE (KUN DE VIGTIGSTE DOKUMENTER – MEGET MINDRE UI) */}
+              <div className="bg-white rounded-2xl p-4 border border-slate-200/80 shadow-xs">
+                <div className="flex flex-wrap items-center justify-between gap-2 pb-2.5 mb-2.5 border-b border-slate-100">
+                  <div>
+                    <h2 className="text-sm font-bold text-slate-900">
+                      Kerne-Dokumentliste & Aktiv Kontrol
+                    </h2>
+                    <p className="text-[11px] text-slate-500">
+                      Kun sagens vigtigste dokumenter, fotos og plantegninger
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      type="file"
+                      ref={docInputRef}
+                      onChange={(e) => e.target.files && addFilesToCase(e.target.files)}
+                      multiple
+                      className="hidden"
+                      accept="application/pdf,.pdf,.doc,.docx,.txt,image/*"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => docInputRef.current?.click()}
+                      disabled={isAnalyzing}
+                      className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-[11px] font-semibold cursor-pointer"
+                    >
+                      <Upload size={12} />
+                      <span>{isAnalyzing ? "Tjekker..." : "+ Upload fil / foto / plantegning"}</span>
+                    </button>
+                    {uploadedDocs.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => runAnalysis(uploadedDocs.filter((d) => d.file).map((d) => d.file!))}
+                        disabled={isAnalyzing}
+                        title="Kør aktiv AI-kontrol på alle bilag igen"
+                        className="inline-flex items-center gap-1 px-2 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 text-[11px] font-semibold cursor-pointer"
+                      >
+                        <RefreshCw size={12} className={isAnalyzing ? "animate-spin" : ""} />
+                        <span>Tjek igen</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Kompakt liste over de 4 vigtigste kernedokumenter */}
+                <div className="space-y-1.5 text-xs">
+                  <div className="flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-emerald-50/60 border border-emerald-200/80">
+                    <div className="flex items-center gap-2 truncate">
+                      <CheckCircle2 size={13} className="text-emerald-600 flex-shrink-0" />
+                      <span className="font-semibold text-slate-800 truncate">
+                        1. BBR-Meddelelse, Matrikel & Plandata
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={openDocumentRoom}
+                      className="text-[11px] font-semibold text-emerald-800 hover:underline flex-shrink-0 cursor-pointer"
+                    >
+                      Hentet automatisk →
+                    </button>
+                  </div>
+
+                  {profile.paamindelseDokumenter.map((rem, idx) => {
+                    const done = isReminderDocUploaded(rem.id);
+                    return (
+                      <div
+                        key={rem.id}
+                        className={`flex items-center justify-between px-2.5 py-1.5 rounded-lg border ${
+                          done
+                            ? "bg-emerald-50/60 border-emerald-200/80"
+                            : "bg-amber-50/50 border-amber-200/80"
+                        }`}
+                      >
+                        <div className="flex items-center gap-2 truncate">
+                          {done ? (
+                            <CheckCircle2 size={13} className="text-emerald-600 flex-shrink-0" />
+                          ) : (
+                            <AlertTriangle size={13} className="text-amber-600 flex-shrink-0" />
+                          )}
+                          <span className="font-semibold text-slate-800 truncate">
+                            {idx + 2}. {rem.titel}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-1.5 flex-shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => handleToggleReminderResolved(rem.id)}
+                            className={`px-2 py-0.5 rounded text-[10px] font-semibold cursor-pointer ${
+                              done
+                                ? "bg-emerald-100 text-emerald-800"
+                                : "bg-white border border-slate-200 text-slate-700 hover:bg-slate-100"
+                            }`}
+                          >
+                            {done ? "✓ Tjekket" : "Markér modtaget"}
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Aktiv status for uploadede dokumenter & fotos */}
+                {isAnalyzing && (
+                  <div className="mt-3 p-3 rounded-xl bg-blue-50 border border-blue-200 text-blue-900 text-xs flex items-center gap-2.5 animate-pulse">
+                    <RefreshCw size={15} className="animate-spin text-blue-600 flex-shrink-0" />
+                    <div>
+                      <strong className="block">Aktiv AI-dokument- & billedkontrol kører...</strong>
+                      <span className="text-[11px]">
+                        Krydstjekker uploadede filer, fotos og plantegning mod BBR ({profile.bbr.boligarealM2} m²), Byggesag og Afsnit 11.
+                      </span>
+                    </div>
+                  </div>
+                )}
+
+                {uploadedDocs.length > 0 && (
+                  <div className="mt-3 pt-2.5 border-t border-slate-100 space-y-1.5">
+                    <span className="block text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                      Uploadede filer & resultat af aktiv kontrol ({uploadedDocs.length} stk.):
+                    </span>
+                    {uploadedDocs.map((doc) => {
+                      const check = documentChecks.find((c) => c.fileName === doc.name);
+                      return (
+                        <div
+                          key={doc.id}
+                          className="p-2.5 rounded-xl border border-slate-200 bg-slate-50/70 text-xs space-y-1"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="flex items-center gap-2 truncate">
+                              <span
+                                className={`text-[10px] font-bold px-1.5 py-0.5 rounded flex-shrink-0 ${
+                                  check?.status === "afvigelse"
+                                    ? "bg-red-100 text-red-800"
+                                    : check?.status === "opmaerksomhed"
+                                    ? "bg-amber-100 text-amber-900"
+                                    : "bg-emerald-100 text-emerald-800"
+                                }`}
+                              >
+                                {check?.status === "afvigelse"
+                                  ? "Afvigelse"
+                                  : check?.status === "opmaerksomhed"
+                                  ? "OBS"
+                                  : "✓ Tjekket"}
+                              </span>
+                              <strong className="truncate text-slate-900">{doc.name}</strong>
+                            </div>
+                            <div className="flex items-center gap-1 flex-shrink-0">
+                              {doc.objectUrl && (
+                                <a
+                                  href={doc.objectUrl}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="px-2 py-0.5 rounded bg-white border border-slate-200 text-[10px] font-semibold text-slate-700 hover:bg-slate-100"
+                                >
+                                  Åbn
+                                </a>
+                              )}
+                              <button
+                                type="button"
+                                onClick={() => handleRemoveUploadedItem(doc.id)}
+                                className="p-1 text-slate-400 hover:text-red-600 cursor-pointer"
+                                title="Fjern fil"
+                              >
+                                <X size={12} />
+                              </button>
+                            </div>
+                          </div>
+                          {check && (
+                            <p className="text-[11px] text-slate-600 leading-snug">
+                              <strong>{check.kategori}:</strong> {check.fundOverskrift}
+                            </p>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {/* B. PLANTEGNINGS- & BILLEDKONTROL (L×B MED 10 CM INDERVÆG, 35 CM YDERVÆG & ±15 % BBR-TOLERANCE) */}
+              <div className="bg-white rounded-2xl p-4 border border-slate-200/80 shadow-xs">
+                <div className="flex items-center justify-between gap-2 pb-2.5 mb-2.5 border-b border-slate-100">
+                  <div className="flex items-center gap-2">
+                    <Ruler size={15} className="text-blue-600" />
+                    <div>
+                      <h2 className="text-sm font-bold text-slate-900">
+                        Plantegnings- & Billedkontrol (L×B mod BBR ±15 %)
+                      </h2>
+                      <p className="text-[11px] text-slate-500">
+                        Indvendige mål tillægges 10 cm pr. indervæg og 35 cm pr. ydervæg
+                      </p>
+                    </div>
+                  </div>
+                  <span
+                    className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
+                      liveWithin15Pct
+                        ? "bg-emerald-50 text-emerald-800 border-emerald-200"
+                        : "bg-red-50 text-red-800 border-red-200"
+                    }`}
+                  >
+                    {liveWithin15Pct
+                      ? `✓ Inden for ±15 % (${liveDiffPct > 0 ? "+" : ""}${liveDiffPct} %)`
+                      : `⚠ Afviger ${liveDiffPct > 0 ? "+" : ""}${liveDiffPct} % (>15 %)`}
+                  </span>
+                </div>
+
+                <form onSubmit={handleCalculateFloorplan} className="space-y-2.5 text-xs">
+                  <div className="grid grid-cols-3 gap-2">
+                    <div>
+                      <label htmlFor="fp-length-input" className="block text-[10px] font-semibold text-slate-500 mb-0.5">
+                        Indv. længde L (m)
+                      </label>
+                      <input
+                        id="fp-length-input"
+                        type="text"
+                        inputMode="decimal"
+                        value={fpLengthM}
+                        onChange={(e) => setFpLengthM(e.target.value)}
+                        className="w-full border border-slate-200 rounded-lg px-2.5 py-1.5 bg-slate-50 focus:bg-white font-semibold text-slate-900 outline-none focus:border-slate-900"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="fp-width-input" className="block text-[10px] font-semibold text-slate-500 mb-0.5">
+                        Indv. bredde B (m)
+                      </label>
+                      <input
+                        id="fp-width-input"
+                        type="text"
+                        inputMode="decimal"
+                        value={fpWidthM}
+                        onChange={(e) => setFpWidthM(e.target.value)}
+                        className="w-full border border-slate-200 rounded-lg px-2.5 py-1.5 bg-slate-50 focus:bg-white font-semibold text-slate-900 outline-none focus:border-slate-900"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="fp-walls-input" className="block text-[10px] font-semibold text-slate-500 mb-0.5">
+                        Skillevægge (10 cm)
+                      </label>
+                      <input
+                        id="fp-walls-input"
+                        type="number"
+                        min={0}
+                        max={25}
+                        value={fpInnerWalls}
+                        onChange={(e) => setFpInnerWalls(e.target.value)}
+                        className="w-full border border-slate-200 rounded-lg px-2.5 py-1.5 bg-slate-50 focus:bg-white font-semibold text-slate-900 outline-none focus:border-slate-900"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200/80 space-y-1 text-[11px]">
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">Indvendigt mål (L × B = {liveLm} × {liveBm} m):</span>
+                      <strong className="text-slate-900">{liveNettoM2} m² netto</strong>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">+ Tillæg indervægge ({liveWalls} stk. á 10 cm):</span>
+                      <strong className="text-slate-900">+{liveInnerWallAddM2} m²</strong>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">+ Tillæg ydervægge (klimaskærm á 35 cm):</span>
+                      <strong className="text-slate-900">+{liveOuterWallAddM2} m²</strong>
+                    </div>
+                    <div className="flex justify-between pt-1 border-t border-slate-200 font-bold text-xs">
+                      <span className="text-slate-900">Beregnet BBR-bruttoareal vs. BBR ({liveBbrM2} m²):</span>
+                      <span className={liveWithin15Pct ? "text-emerald-700" : "text-red-700"}>
+                        {liveBruttoM2} m² ({liveDiffM2 > 0 ? `+${liveDiffM2}` : liveDiffM2} m² /{" "}
+                        {liveDiffPct > 0 ? `+${liveDiffPct}` : liveDiffPct} %)
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-between gap-2">
+                    <button
+                      type="submit"
+                      disabled={isSavingFloorplan}
+                      className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-[11px] font-semibold cursor-pointer"
+                    >
+                      {isSavingFloorplan ? "Gemmer..." : "Gem L×B kontrol på sagen"}
+                    </button>
+                    {!liveWithin15Pct && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          handleAddClauseToAfsnit11(
+                            `Ved kontrolopmåling af plantegning (indvendige mål ${liveLm} × ${liveBm} m korrigeret for 10 cm indervægge og 35 cm ydervægge) er det beregnede bruttoareal opgjort til ca. ${liveBruttoM2} m² mod det i BBR registrerede boligareal på ${liveBbrM2} m² (afvigelse på ${liveDiffPct} %). Køber er gjort udtrykkeligt opmærksom på arealafvigelsen og kan ikke rette krav mod sælger eller medvirkende ejendomsmægler.`
+                          )
+                        }
+                        className="px-2.5 py-1.5 rounded-lg bg-red-600 hover:bg-red-700 text-white text-[11px] font-semibold cursor-pointer"
+                      >
+                        + Overfør afvigelse til Afsnit 11
+                      </button>
+                    )}
+                  </div>
+                </form>
+              </div>
+            </div>
+
+            {/* HØJRE (6/12): MEGET MERE FREMTRÆDENDE FORSLAG TIL KØBSAFTALENS AFSNIT 11 */}
+            <div className="lg:col-span-6 bg-white rounded-2xl p-4 border-2 border-slate-900 shadow-xs space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2 pb-2.5 border-b border-slate-200">
+                <div>
+                  <span className="inline-block text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded bg-slate-900 text-white mb-1">
+                    Købsaftalens Afsnit 11 · Individuelle Vilkår
+                  </span>
+                  <h2 className="text-base font-bold text-slate-900">
+                    Forslag til Købsaftalens Afsnit 11 ({structuredAfsnit11.length} stk.)
+                  </h2>
+                  <p className="text-[11px] text-slate-500">
+                    Genereret ud fra BBR, Matrikel, Tingbog, Plantegning (L×B) og uploadede dokumenter
+                  </p>
+                </div>
+
+                {activeClausesList.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => handleCopyClause("all-clauses", activeClausesList.join("\n\n"))}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold transition-colors cursor-pointer"
+                  >
+                    {copiedClauseId === "all-clauses" ? <Check size={14} /> : <Copy size={14} />}
+                    <span>{copiedClauseId === "all-clauses" ? "Alle kopieret!" : "Kopiér alle klausuler"}</span>
+                  </button>
+                )}
+              </div>
+
+              <div className="space-y-2.5 max-h-[430px] overflow-y-auto pr-1">
+                {structuredAfsnit11.map((item, idx) => (
+                  <div
+                    key={item.id || idx}
+                    className="p-3 rounded-xl border border-slate-200 bg-slate-50/70 hover:bg-white transition-colors space-y-1.5"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-1.5 truncate">
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-blue-100 text-blue-900">
+                          {item.kilde}
+                        </span>
+                        <strong className="text-xs text-slate-900 truncate">{item.titel}</strong>
+                      </div>
+                      <div className="flex items-center gap-1 flex-shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => handleCopyClause(`cl-${idx}`, item.tekst)}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-[10px] font-semibold cursor-pointer"
+                        >
+                          {copiedClauseId === `cl-${idx}` ? <Check size={11} /> : <Copy size={11} />}
+                          <span>{copiedClauseId === `cl-${idx}` ? "Kopieret" : "Kopiér"}</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveClauseFromAfsnit11(item.tekst)}
+                          className="p-1 rounded-lg text-slate-400 hover:text-red-600 hover:bg-red-50 cursor-pointer"
+                          title="Fjern klausul"
+                        >
+                          <Trash2 size={12} />
+                        </button>
+                      </div>
+                    </div>
+                    <p className="text-xs text-slate-800 leading-relaxed bg-white p-2.5 rounded-lg border border-slate-200/80 italic">
+                      &ldquo;{item.tekst}&rdquo;
+                    </p>
+                  </div>
+                ))}
+              </div>
+
+              {/* Tilføj ekstra Afsnit 11-klausul direkte */}
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  handleAddClauseToAfsnit11(newClauseInput);
+                }}
+                className="flex items-center gap-2 pt-2 border-t border-slate-100"
+              >
+                <label htmlFor="new-afsnit11-input" className="sr-only">
+                  Tilføj ny klausul til Afsnit 11
+                </label>
+                <input
+                  id="new-afsnit11-input"
+                  type="text"
+                  value={newClauseInput}
+                  onChange={(e) => setNewClauseInput(e.target.value)}
+                  placeholder="Tilføj egen formulering til Købsaftalens Afsnit 11..."
+                  className="flex-1 border border-slate-200 rounded-xl px-3 py-2 text-xs bg-slate-50 focus:bg-white outline-none focus:border-slate-900"
+                />
+                <button
+                  type="submit"
+                  disabled={!newClauseInput.trim()}
+                  className="inline-flex items-center gap-1 px-3 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 disabled:opacity-40 text-white text-xs font-semibold cursor-pointer"
+                >
+                  <Plus size={13} />
+                  <span>Tilføj</span>
+                </button>
+              </form>
+            </div>
+          </section>
+        )}
+
+        {/* 3. VURDERINGSBEREGNER (PROJEKT 15) – KUN 3 RENOVERINGSNIVEAUER + UPLOAD BILLEDER */}
+        {selectedAddress && profile && (
+          <section className="bg-white rounded-2xl p-4 border border-slate-200/80 shadow-xs">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
               <div>
-                <h2 className="text-base font-bold text-slate-900">Vurderingsberegner (Projekt 15)</h2>
-                <p className="text-xs text-slate-500">
-                  Vælg ejendommens stand ({profile.bbr.boligarealM2} m² bolig · {profile.matrikel.registreretArealM2} m² grund ·{" "}
-                  {profile.vurdering.omraadeNavn} · Basis {profile.vurdering.basisM2PrisDkk.toLocaleString("da-DK")} kr./m²)
+                <h2 className="text-sm font-bold text-slate-900">Vurderingsberegner (Projekt 15)</h2>
+                <p className="text-[11px] text-slate-500">
+                  Vælg stand ({profile.bbr.boligarealM2} m² bolig · {profile.matrikel.registreretArealM2} m² grund · Basis{" "}
+                  {profile.vurdering.basisM2PrisDkk.toLocaleString("da-DK")} kr./m²)
                 </p>
               </div>
 
@@ -1627,24 +2413,15 @@ export default function Home() {
                 <button
                   type="button"
                   onClick={() => photoInputRef.current?.click()}
-                  className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-semibold transition-colors cursor-pointer"
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-semibold transition-colors cursor-pointer"
                 >
-                  <ImagePlus size={14} />
-                  <span>Upload billeder ({uploadedPhotos.length})</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={handleDownloadValuationDocument}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold transition-colors cursor-pointer"
-                >
-                  <FileDown size={14} />
-                  <span>Download Vurderingsdokument</span>
+                  <ImagePlus size={13} />
+                  <span>Upload fotos / plantegning ({uploadedPhotos.length})</span>
                 </button>
               </div>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-3.5">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
               {(["gennemrenoveret", "mellemrenoveret", "ikke_renoveret"] as RenovationLevelKey[]).map((lvlKey) => {
                 const lvl = profile.vurdering.niveauer[lvlKey];
                 const isSelected = renovationLevel === lvlKey;
@@ -1653,13 +2430,13 @@ export default function Home() {
                     key={lvlKey}
                     type="button"
                     onClick={() => handleChangeRenovationLevel(lvlKey)}
-                    className={`text-left rounded-xl p-4 border transition-all cursor-pointer ${
+                    className={`text-left rounded-xl p-3.5 border transition-all cursor-pointer ${
                       isSelected
                         ? "border-slate-900 bg-slate-900 text-white shadow-xs"
                         : "border-slate-200 bg-slate-50/50 hover:bg-white hover:border-slate-300 text-slate-900"
                     }`}
                   >
-                    <div className="flex items-center justify-between mb-1.5">
+                    <div className="flex items-center justify-between mb-1">
                       <span className="font-bold text-xs">{lvl.label}</span>
                       <span
                         className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${
@@ -1669,12 +2446,10 @@ export default function Home() {
                         {lvl.m2PrisDkk.toLocaleString("da-DK")} kr./m²
                       </span>
                     </div>
-
-                    <p className="text-xl font-extrabold tracking-tight">
+                    <p className="text-lg font-extrabold tracking-tight">
                       {lvl.estimatDkk.toLocaleString("da-DK")} kr.
                     </p>
-
-                    <p className={`text-[11px] mt-0.5 ${isSelected ? "text-slate-300" : "text-slate-500"}`}>
+                    <p className={`text-[10px] mt-0.5 ${isSelected ? "text-slate-300" : "text-slate-500"}`}>
                       Spænd: {(lvl.intervalMinDkk / 1e6).toFixed(2).replace(".", ",")} –{" "}
                       {(lvl.intervalMaxDkk / 1e6).toFixed(2).replace(".", ",")} mio. kr.
                     </p>
@@ -1682,150 +2457,32 @@ export default function Home() {
                 );
               })}
             </div>
-
-            {uploadedPhotos.length > 0 && (
-              <div className="mt-4 pt-3 border-t border-slate-100">
-                <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 gap-2.5">
-                  {uploadedPhotos.map((photo) => (
-                    <div
-                      key={photo.id}
-                      className="relative group rounded-xl overflow-hidden border border-slate-200 bg-slate-50 h-16"
-                    >
-                      {photo.objectUrl ? (
-                        <img src={photo.objectUrl} alt={photo.name} className="w-full h-full object-cover" />
-                      ) : (
-                        <div className="w-full h-full flex items-center justify-center text-[10px] text-slate-500 px-2 text-center truncate">
-                          {photo.name}
-                        </div>
-                      )}
-                      <button
-                        type="button"
-                        onClick={() => handleRemoveUploadedItem(photo.id)}
-                        className="absolute top-1 right-1 w-5 h-5 rounded-full bg-slate-900/80 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
-                        title="Fjern billede"
-                      >
-                        <Trash2 size={11} />
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
           </section>
         )}
 
-        {/* SAGSSTYRING, DOKUMENT-OVERVÅGNING & INTERAKTIV SAGS-AI (HVOR MÆGLER KAN SKRIVE TIL AI OG OPDATERE SAGEN) */}
+        {/* 4. SAGS-AI & VALGFRIT SÆLGERSKEMA (MED MULIGHED FOR AT VINGE SÆLGERSPØRGSMÅL FRA) */}
         {selectedAddress && profile && (
-          <section
-            onDragOver={(e) => {
-              e.preventDefault();
-              setIsDraggingOver(true);
-            }}
-            onDragLeave={() => setIsDraggingOver(false)}
-            onDrop={(e) => {
-              e.preventDefault();
-              setIsDraggingOver(false);
-              if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-                addFilesToCase(e.dataTransfer.files);
-              }
-            }}
-            className={`bg-white rounded-2xl p-5 border transition-all shadow-xs ${
-              isDraggingOver ? "border-blue-600 ring-2 ring-blue-100" : "border-slate-200/80"
-            }`}
-          >
-            {/* Øverste linje: Sagsstatus + Dokument-påmindelser + Upload/Hent knapper */}
-            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 pb-4 border-b border-slate-100">
-              <div>
-                <div className="flex flex-wrap items-center gap-2">
-                  <h2 className="text-sm font-bold text-slate-900">
-                    Sagsstyring & Dokumentkontrol
-                  </h2>
-                  <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-md border ${workflowMeta.badgeClass}`}>
-                    {workflowMeta.label}
-                  </span>
-                  <span className="text-[11px] text-slate-400">
-                    Klik på et dokumentpunkt for at markere som modtaget eller upload fil
-                  </span>
-                </div>
-
-                <div className="flex flex-wrap gap-1.5 mt-2">
-                  {profile.paamindelseDokumenter.map((rem) => {
-                    const done = isReminderDocUploaded(rem.id);
-                    return (
-                      <button
-                        key={rem.id}
-                        type="button"
-                        onClick={() => handleToggleReminderResolved(rem.id)}
-                        title={`${rem.beskrivelse} (Klik for at skifte status)`}
-                        className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-medium border transition-colors cursor-pointer ${
-                          done
-                            ? "bg-emerald-50 border-emerald-200 text-emerald-800"
-                            : "bg-amber-50/70 border-amber-200 text-amber-900 hover:bg-amber-100/70"
-                        }`}
-                      >
-                        {done ? (
-                          <CheckCircle2 size={12} className="text-emerald-600" />
-                        ) : (
-                          <AlertTriangle size={12} className="text-amber-600" />
-                        )}
-                        <span>{rem.titel}</span>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              <div className="flex flex-wrap items-center gap-2 flex-shrink-0">
-                <input
-                  type="file"
-                  ref={docInputRef}
-                  onChange={(e) => e.target.files && addFilesToCase(e.target.files, "document")}
-                  multiple
-                  className="hidden"
-                  accept="application/pdf,.pdf,.doc,.docx,.txt,image/*"
-                />
-                <button
-                  type="button"
-                  onClick={() => docInputRef.current?.click()}
-                  disabled={isAnalyzing}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold transition-colors cursor-pointer"
-                >
-                  <Upload size={14} />
-                  <span>{isAnalyzing ? "Analyserer..." : "Upload dokumenter"}</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={openDocumentRoom}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold transition-colors cursor-pointer"
-                >
-                  <FolderOpen size={14} />
-                  <span>Hent dokumenter ({totalDocumentsInRoom})</span>
-                </button>
-              </div>
-            </div>
-
-            {/* SAGS-AI & RETTELSESFELT (MÆGLER KAN SKRIVE TIL AI FOR AT RETTE/OPDATERE SAGEN ELLER VEDHÆFTE BILAG) */}
-            <div className="mt-4 bg-slate-50/80 rounded-xl p-4 border border-slate-200/80">
+          <section className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+            {/* SAGS-AI (7/12) */}
+            <div className="lg:col-span-7 bg-white rounded-2xl p-4 border border-slate-200/80 shadow-xs">
               <div className="flex flex-wrap items-center justify-between gap-2 mb-2.5">
                 <div className="flex items-center gap-1.5">
                   <Sparkles size={14} className="text-blue-600" />
-                  <h3 className="text-xs font-bold text-slate-900">
+                  <h2 className="text-xs font-bold text-slate-900">
                     Skriv til Sags-AI (Ret forhold, afklar dokumenter eller opdatér Afsnit 11)
-                  </h3>
+                  </h2>
                 </div>
                 <div className="flex flex-wrap items-center gap-1">
                   {[
                     "Carport/udhus er godkendt – fjern BBR-anmærkning",
                     "Tingbogsattest er tjekket uden anmærkninger",
-                    "Hvad mangler på sagen nu?",
                   ].map((quickPrompt) => (
                     <button
                       key={quickPrompt}
                       type="button"
                       disabled={isSendingToAi}
                       onClick={() => handleSendToCaseAssistant(quickPrompt)}
-                      className="px-2 py-0.5 rounded-md bg-white hover:bg-blue-50 text-slate-600 hover:text-blue-700 border border-slate-200 text-[10px] font-medium transition-colors cursor-pointer"
+                      className="px-2 py-0.5 rounded-md bg-slate-50 hover:bg-blue-50 text-slate-600 hover:text-blue-700 border border-slate-200 text-[10px] font-medium transition-colors cursor-pointer"
                     >
                       {quickPrompt}
                     </button>
@@ -1833,45 +2490,28 @@ export default function Home() {
                 </div>
               </div>
 
-              {/* Statuslog & samtale med Sags-AI */}
               {activeCase?.assistantMessages && activeCase.assistantMessages.length > 0 && (
-                <div className="space-y-2 max-h-44 overflow-y-auto mb-3 pr-1">
-                  {activeCase.assistantMessages.slice(-6).map((msg) => (
+                <div className="space-y-1.5 max-h-36 overflow-y-auto mb-2.5 pr-1">
+                  {activeCase.assistantMessages.slice(-4).map((msg) => (
                     <div
                       key={msg.id}
-                      className={`p-2.5 rounded-lg text-xs leading-relaxed border ${
+                      className={`p-2 rounded-lg text-xs leading-relaxed border ${
                         msg.sender === "agent"
                           ? "bg-slate-900 text-white border-slate-900 ml-6"
-                          : "bg-white text-slate-800 border-slate-200/90 mr-4"
+                          : "bg-slate-50 text-slate-800 border-slate-200/90 mr-4"
                       }`}
                     >
                       <div className="flex items-center justify-between gap-2 mb-0.5">
                         <span className={`text-[10px] font-bold ${msg.sender === "agent" ? "text-slate-300" : "text-blue-700"}`}>
                           {msg.sender === "agent" ? currentAgent.name : "Sags-AI"}
                         </span>
-                        <span className={`text-[10px] ${msg.sender === "agent" ? "text-slate-400" : "text-slate-400"}`}>
-                          {new Date(msg.createdAt).toLocaleTimeString("da-DK", { hour: "2-digit", minute: "2-digit" })}
-                        </span>
                       </div>
-                      <p>{msg.text}</p>
-                      {msg.actionsTaken && msg.actionsTaken.length > 0 && (
-                        <div className="flex flex-wrap gap-1 mt-1.5">
-                          {msg.actionsTaken.map((act, idx) => (
-                            <span
-                              key={idx}
-                              className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-50 text-emerald-800 border border-emerald-200 text-[10px] font-semibold"
-                            >
-                              ✓ {act}
-                            </span>
-                          ))}
-                        </div>
-                      )}
+                      <p className="text-[11px]">{msg.text}</p>
                     </div>
                   ))}
                 </div>
               )}
 
-              {/* Vedhæftede filer klar til afsendelse i assistenten */}
               {assistantFiles.length > 0 && (
                 <div className="flex flex-wrap gap-1.5 mb-2">
                   {assistantFiles.map((f, i) => (
@@ -1916,9 +2556,9 @@ export default function Home() {
                   type="button"
                   onClick={() => assistantFileInputRef.current?.click()}
                   title="Vedhæft bilag til Sags-AI"
-                  className="p-2 rounded-xl bg-white hover:bg-slate-100 text-slate-600 border border-slate-200 transition-colors cursor-pointer flex-shrink-0"
+                  className="p-2 rounded-xl bg-slate-50 hover:bg-slate-100 text-slate-600 border border-slate-200 transition-colors cursor-pointer flex-shrink-0"
                 >
-                  <Paperclip size={15} />
+                  <Paperclip size={14} />
                 </button>
 
                 <label htmlFor="case-assistant-input" className="sr-only">
@@ -1946,160 +2586,98 @@ export default function Home() {
                       handleSendToCaseAssistant();
                     }
                   }}
-                  placeholder="Skriv f.eks.: 'Carporten er nu godkendt i BBR, fjern advarslen' eller 'Tilføj til Afsnit 11 at...' "
-                  className="flex-1 bg-white border border-slate-200 rounded-xl px-3.5 py-2 text-xs text-slate-900 outline-none focus:border-slate-900"
+                  placeholder="Skriv f.eks.: 'Carporten er godkendt' eller 'Tilføj til Afsnit 11 at...' "
+                  className="flex-1 bg-slate-50 focus:bg-white border border-slate-200 rounded-xl px-3 py-2 text-xs text-slate-900 outline-none focus:border-slate-900"
                 />
 
                 <button
                   type="submit"
                   disabled={isSendingToAi || (!assistantInput.trim() && assistantFiles.length === 0)}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 disabled:opacity-40 text-white text-xs font-semibold transition-colors cursor-pointer flex-shrink-0"
+                  className="inline-flex items-center gap-1 px-3 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 disabled:opacity-40 text-white text-xs font-semibold transition-colors cursor-pointer flex-shrink-0"
                 >
-                  <Send size={13} />
-                  <span>{isSendingToAi ? "Opdaterer..." : "Opdatér sag"}</span>
+                  <Send size={12} />
+                  <span>{isSendingToAi ? "Opdaterer..." : "Opdatér"}</span>
                 </button>
               </form>
             </div>
 
-            {/* Kompakt visning af Afsnit 11 / Observanda & Digitalt Sælgerskema */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4 pt-4 border-t border-slate-100">
-              <details className="group rounded-xl border border-slate-200/80 bg-slate-50/50 p-3.5" open>
-                <summary className="flex items-center justify-between cursor-pointer select-none font-semibold text-xs text-slate-800">
-                  <span>
-                    Observanda & Afsnit 11-klausuler ({activeClausesList.length} klausuler ·{" "}
-                    {profile.roedeFlag.filter((f) => !resolvedFlagsSet.has(f.id)).length} aktive observanda)
-                  </span>
-                  <span className="text-slate-400 group-open:rotate-180 transition-transform">▼</span>
-                </summary>
-
-                <div className="mt-3 space-y-2 text-xs">
-                  {profile.roedeFlag.map((flag) => {
-                    const isResolved = resolvedFlagsSet.has(flag.id);
-                    return (
-                      <div
-                        key={flag.id}
-                        className={`p-2.5 rounded-lg border transition-colors ${
-                          isResolved
-                            ? "bg-emerald-50/50 border-emerald-200 text-slate-500"
-                            : "bg-white border-slate-200 text-slate-800"
-                        }`}
-                      >
-                        <div className="flex items-center justify-between gap-2">
-                          <div className="flex items-center gap-1.5 truncate">
-                            <span
-                              className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
-                                isResolved
-                                  ? "bg-emerald-100 text-emerald-800"
-                                  : flag.severity === "kritisk"
-                                  ? "bg-red-100 text-red-800"
-                                  : "bg-amber-100 text-amber-800"
-                              }`}
-                            >
-                              {isResolved ? "✓ Afklaret" : flag.register}
-                            </span>
-                            <strong className={`truncate ${isResolved ? "line-through text-slate-500" : "text-slate-900"}`}>
-                              {flag.title}
-                            </strong>
-                          </div>
-                          <button
-                            type="button"
-                            onClick={() => handleToggleFlagResolved(flag.id)}
-                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-100 hover:bg-slate-200 text-slate-700 text-[10px] font-semibold flex-shrink-0 cursor-pointer"
-                          >
-                            {isResolved ? (
-                              <>
-                                <RotateCcw size={10} /> Genåbn
-                              </>
-                            ) : (
-                              <>
-                                <Check size={10} /> Markér afklaret
-                              </>
-                            )}
-                          </button>
-                        </div>
-                        {!isResolved && (
-                          <p className="text-[11px] text-slate-600 mt-1">{flag.description}</p>
-                        )}
-                      </div>
-                    );
-                  })}
-
-                  <div className="pt-2 border-t border-slate-200/70 space-y-2">
-                    <div className="flex items-center justify-between">
-                      <span className="text-[11px] font-bold text-slate-600 uppercase">
-                        Aktive Afsnit 11-klausuler på sagen:
-                      </span>
-                      {activeClausesList.length > 0 && (
-                        <button
-                          type="button"
-                          onClick={() => handleCopyClause("all-clauses", activeClausesList.join("\n\n"))}
-                          className="inline-flex items-center gap-1 text-[11px] font-semibold text-blue-700 hover:underline cursor-pointer"
-                        >
-                          {copiedClauseId === "all-clauses" ? <Check size={11} /> : <Copy size={11} />}
-                          {copiedClauseId === "all-clauses" ? "Kopieret" : "Kopiér alle"}
-                        </button>
-                      )}
-                    </div>
-                    {activeClausesList.map((clText, idx) => (
-                      <div key={idx} className="bg-white p-2.5 rounded-lg border border-slate-200 flex items-start justify-between gap-2">
-                        <p className="text-[11px] text-slate-700 italic">&ldquo;{clText}&rdquo;</p>
-                        <button
-                          type="button"
-                          onClick={() => handleCopyClause(`cl-${idx}`, clText)}
-                          className="inline-flex items-center gap-1 px-2 py-1 rounded bg-slate-100 hover:bg-slate-200 text-slate-700 text-[10px] font-medium flex-shrink-0 cursor-pointer"
-                        >
-                          {copiedClauseId === `cl-${idx}` ? <Check size={11} /> : <Copy size={11} />}
-                        </button>
-                      </div>
-                    ))}
-                  </div>
+            {/* SÆLGERSPØRGSMÅL MED MULIGHED FOR AT VINGE FRA (5/12) */}
+            <div className="lg:col-span-5 bg-white rounded-2xl p-4 border border-slate-200/80 shadow-xs space-y-2.5">
+              <div className="flex items-center justify-between gap-2 pb-2 border-b border-slate-100">
+                <div>
+                  <h2 className="text-xs font-bold text-slate-900">
+                    Spørgsmål til Sælger ({activeCase?.status || "udkast"})
+                  </h2>
+                  <p className="text-[10px] text-slate-500">
+                    Ving fra hvis sælger ikke skal besvare spørgsmål på sagen
+                  </p>
                 </div>
-              </details>
 
-              <details className="group rounded-xl border border-slate-200/80 bg-slate-50/50 p-3.5">
-                <summary className="flex items-center justify-between cursor-pointer select-none font-semibold text-xs text-slate-800">
-                  <span>
-                    Digitalt Sælgerskema ({profile.saelgerSpoergsmaal.length} faktaspørgsmål · Status:{" "}
-                    {activeCase?.status || "udkast"})
-                  </span>
-                  <span className="text-slate-400 group-open:rotate-180 transition-transform">▼</span>
-                </summary>
-                <div className="mt-3 space-y-2.5 text-xs">
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                    <div>
-                      <label htmlFor="seller-name-input" className="block text-[10px] font-semibold text-slate-500 mb-0.5">
-                        Sælgers fulde navn
-                      </label>
-                      <input
-                        id="seller-name-input"
-                        name="sellerName"
-                        type="text"
-                        autoComplete="name"
-                        placeholder="F.eks. Jens Hansen"
-                        value={sellerName}
-                        onChange={(e) => setSellerName(e.target.value)}
-                        onBlur={() => persistSellerInfo()}
-                        className="w-full border border-slate-200 rounded-lg px-3 py-1.5 bg-white outline-none focus:border-slate-900"
-                      />
-                    </div>
-                    <div>
-                      <label htmlFor="seller-email-input" className="block text-[10px] font-semibold text-slate-500 mb-0.5">
-                        Sælgers e-mailadresse
-                      </label>
-                      <input
-                        id="seller-email-input"
-                        name="sellerEmail"
-                        type="email"
-                        autoComplete="email"
-                        spellCheck={false}
-                        placeholder="saelger@mail.dk"
-                        value={sellerEmail}
-                        onChange={(e) => setSellerEmail(e.target.value)}
-                        onBlur={() => persistSellerInfo()}
-                        className="w-full border border-slate-200 rounded-lg px-3 py-1.5 bg-white outline-none focus:border-slate-900"
-                      />
-                    </div>
+                <label className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-slate-700 cursor-pointer select-none bg-slate-100 px-2.5 py-1 rounded-lg">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(activeCase?.skipSellerQuestionnaire)}
+                    onChange={(e) => handleToggleSkipSellerQuestionnaire(e.target.checked)}
+                    className="rounded border-slate-300 text-slate-900 focus:ring-slate-900"
+                  />
+                  <span>Sælger skal ikke svare (Fravælg)</span>
+                </label>
+              </div>
+
+              {activeCase?.skipSellerQuestionnaire ? (
+                <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 text-[11px] text-slate-600">
+                  ✓ <strong>Sælgerspørgsmål er vinget fra på denne sag.</strong> Sagen afventer ikke svar fra sælger. Fjern fluebenet ovenfor, hvis du senere ønsker at sende spørgsmål til sælger.
+                </div>
+              ) : (
+                <div className="space-y-2 text-xs">
+                  <div className="max-h-28 overflow-y-auto space-y-1 pr-1 border border-slate-100 rounded-lg p-2 bg-slate-50/50">
+                    {profile.saelgerSpoergsmaal.map((q) => {
+                      const isDisabled = (activeCase?.disabledQuestionIds || []).includes(q.id);
+                      return (
+                        <label
+                          key={q.id}
+                          className="flex items-start gap-2 text-[11px] cursor-pointer select-none"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={!isDisabled}
+                            onChange={() => handleToggleQuestionDisabled(q.id)}
+                            className="mt-0.5 rounded border-slate-300"
+                          />
+                          <span className={isDisabled ? "line-through text-slate-400" : "text-slate-700"}>
+                            <strong>{q.category}:</strong> {q.text}
+                          </span>
+                        </label>
+                      );
+                    })}
                   </div>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <input
+                      id="seller-name-input"
+                      name="sellerName"
+                      type="text"
+                      autoComplete="name"
+                      placeholder="Sælgers navn"
+                      value={sellerName}
+                      onChange={(e) => setSellerName(e.target.value)}
+                      onBlur={() => persistSellerInfo()}
+                      className="border border-slate-200 rounded-lg px-2.5 py-1.5 bg-slate-50 focus:bg-white text-xs outline-none focus:border-slate-900"
+                    />
+                    <input
+                      id="seller-email-input"
+                      name="sellerEmail"
+                      type="email"
+                      autoComplete="email"
+                      spellCheck={false}
+                      placeholder="saelger@mail.dk"
+                      value={sellerEmail}
+                      onChange={(e) => setSellerEmail(e.target.value)}
+                      onBlur={() => persistSellerInfo()}
+                      className="border border-slate-200 rounded-lg px-2.5 py-1.5 bg-slate-50 focus:bg-white text-xs outline-none focus:border-slate-900"
+                    />
+                  </div>
+
                   <div className="flex items-center gap-2">
                     <a
                       href={`/seller/${caseId}`}
@@ -2108,45 +2686,70 @@ export default function Home() {
                         await persistSellerInfo();
                         window.location.href = `/seller/${caseId}`;
                       }}
-                      className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-white border border-slate-200 text-slate-800 hover:bg-slate-100 font-medium"
+                      className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-800 text-[11px] font-semibold"
                     >
-                      <Eye size={13} />
-                      Åbn / Preview skema
+                      <Eye size={12} /> Preview skema
                     </a>
                     <button
                       type="button"
                       onClick={handleSendSellerLink}
-                      className="inline-flex items-center justify-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-slate-900 text-white hover:bg-slate-800 font-medium cursor-pointer"
+                      className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-slate-900 text-white hover:bg-slate-800 text-[11px] font-semibold cursor-pointer"
                     >
-                      <Mail size={13} />
-                      Send til sælger
+                      <Mail size={12} /> Send til sælger
                     </button>
+                    {mailStatus && (
+                      <span className={`text-[11px] ${mailStatus.sent ? "text-emerald-700 font-semibold" : "text-red-600"}`}>
+                        {mailStatus.sent ? "✓ Sendt" : mailStatus.error}
+                      </span>
+                    )}
                   </div>
-                  {mailStatus && (
-                    <p className={mailStatus.sent ? "text-emerald-700 font-medium" : "text-red-600"}>
-                      {mailStatus.sent ? "✓ Sælgerskema sendt" : mailStatus.error}
-                    </p>
-                  )}
                 </div>
-              </details>
+              )}
+            </div>
+          </section>
+        )}
+
+        {/* 5. NEDERST: MINDRE OVERSIGT OVER HVAD SYSTEMET HAR TJEKKET IGENNEM SOM MÆGLER IKKE SKAL TAGE SIG AF */}
+        {selectedAddress && profile && (
+          <section className="bg-emerald-50/40 rounded-2xl px-4 py-3 border border-emerald-200/70">
+            <div className="flex items-center justify-between gap-2 mb-2">
+              <div className="flex items-center gap-1.5">
+                <ShieldCheck size={14} className="text-emerald-700" />
+                <h2 className="text-xs font-bold text-emerald-950">
+                  Kontrolleret & Godkendt uden anmærkninger ({verifiedItemsBottom.length} punkter – mægler behøver ikke foretage sig yderligere)
+                </h2>
+              </div>
+              <span className="text-[10px] font-semibold text-emerald-800">
+                Verificeret mod BBR, Matrikel, Plandata, CVR & Bilag
+              </span>
             </div>
 
-            {analysisResult && (
-              <details className="group rounded-xl border border-slate-200/80 bg-slate-50/50 p-3.5 mt-3">
-                <summary className="flex items-center justify-between cursor-pointer select-none font-semibold text-xs text-slate-800">
-                  <span>7-Trins Dokumentanalyse & Krydstjek (BBR, Matrikel, Tingbog, Plandata)</span>
-                  <span className="text-slate-400 group-open:rotate-180 transition-transform">▼</span>
-                </summary>
-                <div className="mt-2.5 p-3 rounded-lg bg-white border border-slate-200 text-[11px] text-slate-700 whitespace-pre-wrap leading-relaxed max-h-64 overflow-y-auto">
-                  {analysisResult}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-1.5">
+              {verifiedItemsBottom.map((item, idx) => (
+                <div
+                  key={idx}
+                  className="px-2.5 py-1.5 rounded-lg bg-white/90 border border-emerald-200/60 flex items-start gap-2 text-[11px]"
+                >
+                  <CheckCircle2 size={12} className="text-emerald-600 mt-0.5 flex-shrink-0" />
+                  <div className="truncate">
+                    <div className="flex items-center gap-1.5">
+                      <strong className="text-slate-800 truncate">{item.label}</strong>
+                      <span className="text-[9px] px-1 py-0.2 rounded bg-emerald-100 text-emerald-800 font-semibold">
+                        {item.source}
+                      </span>
+                    </div>
+                    <p className="text-[10px] text-slate-500 truncate" title={item.detail}>
+                      {item.detail}
+                    </p>
+                  </div>
                 </div>
-              </details>
-            )}
+              ))}
+            </div>
           </section>
         )}
       </div>
 
-      {/* MÆGLER LOGIN MODAL (<dialog closedby="any"> + AUTOFILL SIGN-IN FORM) */}
+      {/* MÆGLER LOGIN MODAL */}
       <dialog
         ref={loginDialogRef}
         {...({ closedby: "any" } as any)}
@@ -2173,7 +2776,6 @@ export default function Home() {
             </button>
           </div>
 
-          {/* Hurtigvalg til Vejle Mæglerens team */}
           {availableAgents.length > 0 && (
             <div className="mb-5">
               <span className="block text-[11px] font-bold uppercase tracking-wider text-slate-400 mb-2">
@@ -2216,7 +2818,6 @@ export default function Home() {
             </div>
           )}
 
-          {/* Standard Login Formular med korrekt autofill (modern-web-guidance autofill-sign-in-form) */}
           <form method="post" onSubmit={handleAgentLogin} className="space-y-3.5">
             <div>
               <label htmlFor="agent-login-email" className="block text-xs font-semibold text-slate-700 mb-1">
@@ -2279,7 +2880,7 @@ export default function Home() {
         </div>
       </dialog>
 
-      {/* FULDSKÆRMS LIGHTBOX TIL SKRÅFOTO (INKL. VINKELSKIFT LÆNGERE UDE FRA ALLE 4 SIDER) */}
+      {/* FULDSKÆRMS LIGHTBOX TIL SKRÅFOTO */}
       {skraafotoLightbox && profile && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-xs p-4"
@@ -2331,30 +2932,11 @@ export default function Home() {
               loading="lazy"
               title="Skråfoto Forstørret"
             />
-
-            <div className="absolute inset-y-0 left-4 flex items-center z-20 pointer-events-none">
-              <button
-                type="button"
-                onClick={handlePrevOrientation}
-                className="w-11 h-11 rounded-full flex items-center justify-center bg-white/90 hover:bg-white shadow-lg text-slate-900 pointer-events-auto cursor-pointer"
-              >
-                <ChevronLeft size={22} />
-              </button>
-            </div>
-            <div className="absolute inset-y-0 right-4 flex items-center z-20 pointer-events-none">
-              <button
-                type="button"
-                onClick={handleNextOrientation}
-                className="w-11 h-11 rounded-full flex items-center justify-center bg-white/90 hover:bg-white shadow-lg text-slate-900 pointer-events-auto cursor-pointer"
-              >
-                <ChevronRight size={22} />
-              </button>
-            </div>
           </div>
         </div>
       )}
 
-      {/* KØBERKARTOTEK MODAL (<dialog closedby="any"> – KUN 100% EKSAKTE MATCH) */}
+      {/* KØBERKARTOTEK MODAL */}
       <dialog
         ref={buyerDialogRef}
         {...({ closedby: "any" } as any)}
@@ -2424,7 +3006,7 @@ export default function Home() {
         )}
       </dialog>
 
-      {/* SAMLET DOKUMENTRUM MODAL (<dialog closedby="any">) */}
+      {/* SAMLET DOKUMENTRUM MODAL */}
       <dialog
         ref={docRoomDialogRef}
         {...({ closedby: "any" } as any)}
@@ -2474,46 +3056,44 @@ export default function Home() {
                   {profile.automatiskeDokumenter.map((doc) => (
                     <div
                       key={doc.id}
-                      className="p-4 rounded-xl border border-slate-200 bg-slate-50/70 flex flex-col justify-between gap-3"
+                      className="p-3.5 rounded-xl border border-slate-200 bg-slate-50/70 flex flex-col justify-between gap-2.5"
                     >
                       <div>
                         <div className="flex items-center justify-between gap-2">
-                          <span className="text-[11px] font-semibold px-2 py-0.5 rounded bg-blue-100 text-blue-800">
+                          <span className="text-[10px] font-semibold px-2 py-0.5 rounded bg-blue-100 text-blue-800">
                             {doc.kilde}
                           </span>
-                          <span className="text-[11px] text-emerald-700 font-semibold">✓ {doc.status}</span>
+                          <span className="text-[10px] text-emerald-700 font-semibold">✓ {doc.status}</span>
                         </div>
-                        <h4 className="font-bold text-sm text-slate-900 mt-1.5">{doc.titel}</h4>
-                        <p className="text-xs text-slate-600 mt-0.5">{doc.beskrivelse}</p>
+                        <h4 className="font-bold text-xs text-slate-900 mt-1">{doc.titel}</h4>
+                        <p className="text-[11px] text-slate-600 mt-0.5">{doc.beskrivelse}</p>
                       </div>
 
-                      <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-slate-200/70">
+                      <div className="flex flex-wrap items-center gap-1.5 pt-2 border-t border-slate-200/70">
                         <button
                           type="button"
                           onClick={() => handleDownloadAutoDoc(doc)}
-                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold transition-colors cursor-pointer"
+                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-[11px] font-semibold cursor-pointer"
                         >
-                          <Download size={13} />
-                          {doc.id === "auto-doc-vurdering" ? "Åbn / Download PDF" : "Hent dokument"}
+                          <Download size={12} />
+                          Hent
                         </button>
-
                         <button
                           type="button"
                           onClick={() => setPreviewAutoDoc(previewAutoDoc?.id === doc.id ? null : doc)}
-                          className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 text-xs font-medium cursor-pointer"
+                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 text-[11px] font-medium cursor-pointer"
                         >
-                          <Eye size={13} />
+                          <Eye size={12} />
                           {previewAutoDoc?.id === doc.id ? "Skjul" : "Vis"}
                         </button>
-
                         {doc.externalUrl && (
                           <a
                             href={doc.externalUrl}
                             target="_blank"
                             rel="noreferrer"
-                            className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-white hover:bg-slate-100 text-blue-700 border border-slate-200 text-xs font-medium"
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white hover:bg-slate-100 text-blue-700 border border-slate-200 text-[11px] font-medium"
                           >
-                            Kilde <ExternalLink size={12} />
+                            Kilde <ExternalLink size={11} />
                           </a>
                         )}
                       </div>
@@ -2539,53 +3119,23 @@ export default function Home() {
               </div>
 
               <div>
-                <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
-                  <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500">
-                    2. Uploadede Dokumenter & Billeder ({uploadedDocs.length} stk.)
-                  </h3>
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => docInputRef.current?.click()}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold cursor-pointer"
-                    >
-                      <Upload size={13} />
-                      Upload dokument
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => photoInputRef.current?.click()}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-semibold cursor-pointer"
-                    >
-                      <ImagePlus size={13} />
-                      Upload billeder
-                    </button>
-                  </div>
-                </div>
-
+                <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500 mb-2">
+                  2. Uploadede Dokumenter, Plantegninger & Fotos ({uploadedDocs.length} stk.)
+                </h3>
                 {uploadedDocs.length > 0 ? (
                   <div className="space-y-2">
                     {uploadedDocs.map((item) => (
                       <div
                         key={item.id}
-                        className="flex items-center justify-between p-3.5 rounded-xl bg-white border border-slate-200 text-xs"
+                        className="flex items-center justify-between p-3 rounded-xl bg-white border border-slate-200 text-xs"
                       >
                         <div className="flex items-center gap-3 truncate">
-                          {item.type === "photo" && item.objectUrl ? (
-                            <img
-                              src={item.objectUrl}
-                              alt={item.name}
-                              className="w-10 h-10 rounded-lg object-cover border border-slate-200"
-                            />
-                          ) : (
-                            <div className="w-10 h-10 rounded-lg bg-blue-50 text-blue-700 flex items-center justify-center">
-                              <FileText size={18} />
-                            </div>
-                          )}
+                          <FileText size={16} className="text-blue-600 flex-shrink-0" />
                           <div className="truncate">
                             <p className="font-bold text-slate-900 truncate">{item.name}</p>
-                            <p className="text-slate-500">
-                              {item.type === "photo" ? "Billede" : "Dokument"} · {item.sizeKb} KB · kl. {item.uploadedAt}
+                            <p className="text-[11px] text-slate-500">
+                              {item.type === "photo" ? "Billede/Plantegning" : "Dokument"} · {item.sizeKb} KB · kl.{" "}
+                              {item.uploadedAt}
                             </p>
                           </div>
                         </div>
@@ -2595,9 +3145,9 @@ export default function Home() {
                             <a
                               href={item.objectUrl}
                               download={item.name}
-                              className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-800 font-semibold"
+                              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-800 font-semibold"
                             >
-                              <Download size={13} />
+                              <Download size={12} />
                               Hent
                             </a>
                           )}
@@ -2614,15 +3164,7 @@ export default function Home() {
                     ))}
                   </div>
                 ) : (
-                  <div
-                    onClick={() => docInputRef.current?.click()}
-                    className="border-2 border-dashed border-slate-200 hover:border-slate-400 rounded-xl p-6 text-center cursor-pointer bg-slate-50/50 transition-colors"
-                  >
-                    <Upload size={22} className="mx-auto text-slate-400 mb-1.5" />
-                    <p className="text-xs font-semibold text-slate-800">
-                      Træk og slip dokumenter eller billeder her, eller klik for at uploade
-                    </p>
-                  </div>
+                  <p className="text-xs text-slate-500">Ingen filer uploadet endnu.</p>
                 )}
               </div>
             </div>

@@ -14,6 +14,7 @@ import {
   getSellerCase,
   listCasesForAgent,
   makeCaseId,
+  saveUploadedFileToDisk,
   upsertSellerCase,
 } from "@/lib/case-store";
 import { fetchFullPropertyProfile, RenovationLevelKey } from "@/lib/property-aggregator";
@@ -100,12 +101,23 @@ export async function POST(request: Request) {
         resolvedReminders.add(matchedRem);
         actionsTaken.push(`Registrerede ${file.name} i Dokumentrum`);
       }
-      if (!nextDocMetas.some((d) => d.name === file.name)) {
+      const existingMeta = nextDocMetas.find((d) => d.name === file.name);
+      const docId = existingMeta?.id || `doc-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      const isImage = file.type.startsWith("image/") || /\.(png|jpg|jpeg|webp)$/i.test(file.name);
+      saveUploadedFileToDisk(
+        resolvedId,
+        docId,
+        file.name,
+        file.type || (isImage ? "image/png" : "application/pdf"),
+        buffer
+      );
+      if (!existingMeta) {
         nextDocMetas.push({
-          id: `doc-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          id: docId,
           name: file.name,
           sizeKb: Math.max(1, Math.round(file.size / 1024)),
-          type: file.type.startsWith("image/") ? "photo" : "document",
+          type: isImage ? "photo" : "document",
+          mimeType: file.type || (isImage ? "image/png" : "application/pdf"),
           uploadedAt: nowTime,
           matchedReminderId: matchedRem,
         });

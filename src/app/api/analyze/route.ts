@@ -1,6 +1,10 @@
 import { NextResponse } from "next/server";
 import { GoogleGenAI } from "@google/genai";
 import {
+  fetchFullPropertyProfile,
+  PropertyFullProfile,
+} from "@/lib/property-aggregator";
+import {
   checkAndReserveAiBudget,
   computePayloadSha256,
   COST_PER_DOC_ANALYSIS_DKK,
@@ -11,117 +15,258 @@ import {
   releaseInFlightLock,
   setCachedAiAnalysis,
 } from "@/lib/ai-cost-guard";
-import { fetchFullPropertyProfile, PropertyFullProfile } from "@/lib/property-aggregator";
-import { parseDocumentTextForTingbog, ParsedTingbogSummary } from "@/lib/tingbog-parser";
 import {
+  buildDefaultCheckForMeta,
+  calculateFloorplanVsBbr,
+  CaseDocumentCheckItem,
+  CaseUploadedDocMeta,
   computeMissingRemindersForCase,
   detectReminderMatchFromFilename,
+  FloorplanCalculation,
   getSellerCase,
+  listUploadedFilesFromDisk,
   makeCaseId,
+  saveUploadedFileToDisk,
   upsertSellerCase,
 } from "@/lib/case-store";
 
-const BOLIGHANDEL_GPT_SYSTEM_PROMPT = `
-Du er Bolighandel-GPT, en højt specialiseret juridisk analytiker i dansk ejendomsret (LOFE, Lov om forbrugerbeskyttelse ved erhvervelse af fast ejendom, Jordforureningsloven, BR18 og DE's etiske regler).
+const BOLIGHANDEL_ANALYSIS_SYSTEM_PROMPT = `
+Du er en dansk juridisk og teknisk ejendomsmægler-revisor (Cand.jur. & Bygningskonstruktør).
+Din opgave er aktivt at gennemgå hvert eneste vedhæftede dokument, plantegning og foto og krydstjekke det 1:1 mod ejendommens autoritative registerdata (BBR, Matrikel, Tingbog, Plandata).
 
-UFRAVIGELIG REGEL OM HÅRDE FAKTA:
-Du må ALDRIG gætte, antage eller opfinde årstal, arealer, byggesagsnumre, olietanke, handelspriser eller hæftelser. Du må UDELUKKENDE forholde dig til de verificerede hårde fakta fra de 5 offentlige registre samt indholdet i de faktisk uploadede dokumenter. Hvis et dokument (f.eks. Tingbogsattest eller Byggesagsarkiv) ikke er uploadet endnu, skal du eksplicit angive, at dokumentet afventer upload.
+STRENGE REGLER:
+1. GÆT ALDRIG: Brug kun verificerede registerdata og det faktiske indhold i de uploadede dokumenter/fotos.
+2. BILLEDKONTROL (FOTOS MOD BBR & BYGGESAG):
+   - Hvis en fil er et foto af ejendommen, tjek om tagmateriale, facademateriale (ydervæg), antal etager og sekundære bygninger (carport, udhus, overdækket terrasse, udestue) stemmer overens med BBR og byggesager.
+   - Hvis der ses uoverensstemmelser (f.eks. uregistreret overdækning/udestue eller andet tagmateriale end BBR), markér status som "afvigelse" eller "opmaerksomhed" og formulér et konkret forslag til Købsaftalens Afsnit 11.
+3. PLANTEGNINGSKONTROL (L×B MOD BBR INDEN FOR ±15 %):
+   - Hvis en fil er en plantegning (eller indeholder rum-/bygningsmål L×B), aflæs de indvendige mål (længde L og bredde B i meter, samt antal indvendige skillevægge eller rumliste).
+   - Husk at plantegninger typisk angiver indvendige mål: Der tillægges 10 cm (0,10 m) pr. indervæg/skillevæg og 35 cm (0,35 m) pr. ydervæg for at beregne BBR-bruttoarealet, som skal ligge inden for ±15 % af BBR-boligarealet.
+4. KØBSAFTALENS AFSNIT 11:
+   - Formulér konkrete, skarpe og kopieringsklare klausuler til Købsaftalens Afsnit 11 for alle relevante fund i dokumenter, billeder, plantegninger og BBR.
 
-DIN ROLLE:
-Du repræsenterer sælgers ejendomsmægler (Vejle Mægleren). Du skal udarbejde en faktabaseret gennemgang i 7 trin inkl. konkrete klausuler til købsaftalens Afsnit 11.
+Returnér ALTID gyldig JSON med præcis denne struktur:
+{
+  "documentChecks": [
+    {
+      "fileName": "navn på fil",
+      "fileType": "document" | "photo" | "floorplan",
+      "status": "ok" | "opmaerksomhed" | "afvigelse",
+      "kategori": "Tingbog & Servitutter" | "Byggesagsarkiv & BBR" | "Plantegning (L×B mod BBR ±15 %)" | "Billedkontrol (Foto mod BBR & Byggesag)" | "Tilstands-, El- & Energirapport" | "Sagsdokument",
+      "fundOverskrift": "Kort præcis konklusion på tjekket af denne fil",
+      "fundDetaljer": [
+        "Konkret punkt 1 tjekket mod BBR/Byggesag/Tingbog",
+        "Konkret punkt 2 tjekket mod BBR/Byggesag/Tingbog"
+      ],
+      "afsnit11Forslag": "Konkret klausultekst til Købsaftalens Afsnit 11 hvis filen giver anledning til forbehold/oplysning, ellers null"
+    }
+  ],
+  "floorplanDetected": {
+    "isFloorplan": true | false,
+    "sourceFileName": "filnavn hvis plantegning, ellers null",
+    "indvendigLaengdeM": 10.4,
+    "indvendigBreddeM": 6.7,
+    "antalIndervaegge": 5,
+    "rumListe": [
+      { "navn": "Stue/Køkken", "laengdeM": 6.2, "breddeM": 4.5, "nettoM2": 27.9 }
+    ]
+  },
+  "markdownSummary": "Kort struktureret revisionsresumé i Markdown"
+}
 `;
+
+function parseDocumentTextForTingbog(rawText: string) {
+  const lower = rawText.toLowerCase();
+  const fundetTingbog =
+    lower.includes("tingbogsattest") ||
+    lower.includes("adkomst") ||
+    lower.includes("hæftelser") ||
+    lower.includes("servitutter");
+
+  const servitutter: string[] = [];
+  const servMatches = rawText.match(/(?:servitut|deklaration|byggelinje|vejret)[^\n\r]{0,120}/gi) || [];
+  for (const m of servMatches.slice(0, 5)) {
+    servitutter.push(m.trim());
+  }
+
+  return {
+    fundetTingbog,
+    servitutter,
+  };
+}
+
+function extractFloorplanFromRawText(
+  rawText: string,
+  fileNames: string[],
+  bbrBoligarealM2: number
+): FloorplanCalculation | null {
+  const floorplanFile = fileNames.find((n) =>
+    /plantegning|tegning|plan|grundplan|opmaaling|opmåling|lxb/i.test(n)
+  );
+  const hasFloorplanKeyword =
+    Boolean(floorplanFile) || /plantegning|indvendig|rummaal|rummål|l\s*x\s*b|længde.*bredde/i.test(rawText);
+
+  if (!hasFloorplanKeyword) return null;
+
+  // Find eksplicitte mål i teksten som f.eks. "10,4 x 6,7" eller "10.4m x 6.7m"
+  const dimRegex = /(\d{1,2}(?:[.,]\d{1,2})?)\s*(?:m\b)?\s*[x×*]\s*(\d{1,2}(?:[.,]\d{1,2})?)\s*(?:m\b)?/gi;
+  const matches: Array<{ l: number; b: number }> = [];
+  let m: RegExpExecArray | null;
+  while ((m = dimRegex.exec(rawText)) !== null) {
+    const l = parseFloat(m[1].replace(",", "."));
+    const b = parseFloat(m[2].replace(",", "."));
+    if (l >= 1.5 && l <= 35 && b >= 1.5 && b <= 35) {
+      matches.push({ l, b });
+    }
+  }
+
+  if (matches.length === 1) {
+    return calculateFloorplanVsBbr({
+      sourceFileName: floorplanFile || fileNames[0] || "Plantegning",
+      indvendigLaengdeM: matches[0].l,
+      indvendigBreddeM: matches[0].b,
+      antalIndervaegge: 5,
+      indervaegTykkelseCm: 10,
+      ydervaegTykkelseCm: 35,
+      bbrBoligarealM2,
+      isDetected: true,
+    });
+  }
+
+  if (matches.length > 1) {
+    const rumListe = matches.slice(0, 10).map((pair, idx) => ({
+      navn: `Rum ${idx + 1}`,
+      laengdeM: pair.l,
+      breddeM: pair.b,
+      nettoM2: Number((pair.l * pair.b).toFixed(1)),
+    }));
+    return calculateFloorplanVsBbr({
+      sourceFileName: floorplanFile || fileNames[0] || "Plantegning",
+      indvendigLaengdeM: 0,
+      indvendigBreddeM: 0,
+      antalIndervaegge: Math.max(3, rumListe.length),
+      indervaegTykkelseCm: 10,
+      ydervaegTykkelseCm: 35,
+      rumListe,
+      bbrBoligarealM2,
+      isDetected: true,
+    });
+  }
+
+  // Hvis filen er en plantegning men uden rå tekst-dimensioner, opret standard kontrolberegning ud fra BBR
+  return calculateFloorplanVsBbr({
+    sourceFileName: floorplanFile || "Plantegning",
+    indvendigLaengdeM: 0,
+    indvendigBreddeM: 0,
+    antalIndervaegge: 5,
+    indervaegTykkelseCm: 10,
+    ydervaegTykkelseCm: 35,
+    bbrBoligarealM2,
+    isDetected: true,
+  });
+}
+
+function buildDeterministicChecksForFiles(
+  metas: CaseUploadedDocMeta[],
+  rawTextsByFile: Record<string, string>,
+  profile: PropertyFullProfile,
+  parsedTingbog: ReturnType<typeof parseDocumentTextForTingbog>,
+  floorplanCheck: FloorplanCalculation | null
+): CaseDocumentCheckItem[] {
+  return metas.map((meta) => {
+    const raw = (rawTextsByFile[meta.name] || "").toLowerCase();
+    const base = buildDefaultCheckForMeta(meta, profile);
+
+    if (base.fileType === "floorplan" && floorplanCheck) {
+      return {
+        ...base,
+        status: floorplanCheck.indenfor15ProcentTolerance ? "ok" : "afvigelse",
+        fundOverskrift: floorplanCheck.indenfor15ProcentTolerance
+          ? `Plantegning L×B (${floorplanCheck.beregnetBruttoArealM2} m² brutto mod BBR ${floorplanCheck.bbrBoligarealM2} m²) – Godkendt inden for ±15 %`
+          : `Plantegning L×B afviger ${floorplanCheck.afvigelseProcent > 0 ? "+" : ""}${floorplanCheck.afvigelseProcent} % fra BBR (${floorplanCheck.beregnetBruttoArealM2} m² mod ${floorplanCheck.bbrBoligarealM2} m²)`,
+        fundDetaljer: [
+          `Indvendige mål: ${floorplanCheck.indvendigLaengdeM} × ${floorplanCheck.indvendigBreddeM} m = ${floorplanCheck.indvendigtNettoArealM2} m² indvendigt nettoareal.`,
+          `Tillæg: +${floorplanCheck.tillaegIndervaeggeM2} m² indervægge (${floorplanCheck.indervaegTykkelseCm} cm) og +${floorplanCheck.tillaegYdervaeggeM2} m² ydervægge (${floorplanCheck.ydervaegTykkelseCm} cm) = ${floorplanCheck.beregnetBruttoArealM2} m² brutto.`,
+          floorplanCheck.konklusionTekst,
+        ],
+        afsnit11Forslag: floorplanCheck.foreslaaetAfsnit11Klausul,
+      };
+    }
+
+    if (parsedTingbog.fundetTingbog && /tingbog|attest|servitut/i.test(meta.name)) {
+      const servitutList = parsedTingbog.servitutter.slice(0, 3);
+      return {
+        ...base,
+        status: servitutList.length > 0 ? "opmaerksomhed" : "ok",
+        fundDetaljer: [
+          `Adkomst og matrikel (${profile.matrikel.matrikelnummer}) kontrolleret mod Tingbogsattest.`,
+          servitutList.length > 0
+            ? `Registrerede servitutter i dokumentet: ${servitutList.join(" · ")}`
+            : `Ingen servitutkonflikter konstateret mod BBR og anvendelse.`,
+        ],
+      };
+    }
+
+    if (raw.includes("udestue") || raw.includes("overdækning") || raw.includes("uden tilladelse")) {
+      return {
+        ...base,
+        status: "afvigelse",
+        fundOverskrift: `Uoverensstemmelse fundet i ${meta.name} mod BBR`,
+        fundDetaljer: [
+          `Dokumentet nævner bygningsdel (udestue/overdækning/forhold uden tilladelse), som afviger fra BBR hoveddata (${profile.bbr.boligarealM2} m²).`,
+          `Kræver oplysning og ansvarsfraskrivelse i Købsaftalens Afsnit 11.`,
+        ],
+        afsnit11Forslag: `Det fremgår af sagens dokumenter (${meta.name}), at der på ejendommen findes bygningsmæssige forhold/overdækning, som ikke fuldt ud svarer til BBR-registreringen. Køber er gjort bekendt hermed og overtager forholdet uden ansvar for sælger eller medvirkende ejendomsmægler.`,
+      };
+    }
+
+    return base;
+  });
+}
 
 function buildDeterministic7StepReport(
   profile: PropertyFullProfile,
   fileNames: string[],
-  parsedTingbog: ParsedTingbogSummary
+  parsedTingbog: ReturnType<typeof parseDocumentTextForTingbog>,
+  docChecks: CaseDocumentCheckItem[],
+  floorplanCheck: FloorplanCalculation | null
 ): string {
-  const secList = profile.bbr.sekundaereBygninger
-    .map((s) => `${s.typeTekst}: ${s.arealM2} m²${s.opfoerelsesaar ? ` (opført ${s.opfoerelsesaar})` : ""}`)
-    .join(", ");
-  const olieList =
-    profile.bbr.tekniskeAnlaeg.length > 0
-      ? profile.bbr.tekniskeAnlaeg
-          .map((t) => `${t.typeTekst} (${t.driftstatusTekst}${t.volumenLiter ? `, ${t.volumenLiter} L` : ""})`)
-          .join("; ")
-      : "Ingen registrerede tanke i BBR_TekniskAnlaeg";
-  const byggesagList =
-    profile.bbr.byggesager.length > 0
-      ? profile.bbr.byggesager.map((b) => `${b.sagsnummer}: ${b.sagsartTekst} – ${b.statusTekst}`).join("\n  - ")
-      : "Ingen åbne byggesager registreret i BBR_Byggesag";
-
-  const criticalFlags = profile.roedeFlag.filter((f) => f.severity === "kritisk");
-  const warningFlags = profile.roedeFlag.filter((f) => f.severity === "advarsel");
-  const infoFlags = profile.roedeFlag.filter((f) => f.severity === "info");
+  const bbr = profile.bbr;
+  const mat = profile.matrikel;
+  const plan = profile.plandata;
 
   return `## 🏛️ Juridisk Fakta- & Krydsrevisionsrapport (Kun Verificerede Registerdata)
-**Ejendom:** ${profile.adresse} (BFE-nr.: ${profile.bbr.bfeNummer || "Ikke oplyst"} | Matr.nr.: ${profile.matrikel.matrikelnummer || "Ikke oplyst"}, ${profile.matrikel.ejerlavsnavn || "Ikke oplyst"})
+**Ejendom:** ${profile.adresse} (BFE-nr.: ${bbr.bfeNummer || "Ikke oplyst"} | Matr.nr.: ${mat.matrikelnummer || "—"}, ${mat.ejerlavsnavn || "—"})
 
 ---
 
-### Trin 1: Identifikation af Dokumenter & Autoritative Registre
-* **Uploadede sagsdokumenter (${fileNames.length} stk.):** ${fileNames.length > 0 ? fileNames.join(", ") : "Ingen dokumenter uploadet endnu – rapporten bygger udelukkende på verificerede offentlige registeropslag."}
-* **Verificerede offentlige registre:**
-  1. **BBR (\`DAR/v3\` & \`BBR/v3\`):** ${profile.kildeStatus.bbr} (${profile.bbr.boligarealM2 || "—"} m² bolig, opført ${profile.bbr.opfoerelsesaar ?? "—"})
-  2. **Matriklen (\`MAT/v2\`):** ${profile.kildeStatus.matrikel} (${profile.matrikel.registreretArealM2 || "—"} m² grundareal)
-  3. **Plandata.dk (\`WFS\`):** ${profile.plandata.lokalplanId ? `Lokalplan ${profile.plandata.lokalplanId} (${profile.plandata.lokalplanNavn})` : `Ingen særskilt lokalplan (${profile.plandata.kommuneplanNavn})`}
-  4. **Vurderingsportalen & EJF/Handelshistorik:** ${
-    profile.tingbog.offentligEjendomsvaerdiDkk
-      ? `${profile.tingbog.vurderingsStatusTekst}: ${profile.tingbog.offentligEjendomsvaerdiDkk.toLocaleString("da-DK")} kr.`
-      : "Offentlig vurdering ikke tilgængelig via offentligt API"
-  }${profile.tingbog.senesteHandelsprisDkk ? ` | Seneste tinglyste handel: ${profile.tingbog.senesteHandelsprisDkk.toLocaleString("da-DK")} kr. (${profile.tingbog.senesteHandelsdato})` : ""}
-  5. **CVR-Registret:** ${profile.cvr.harAktivtErhvervPaaAdressen ? `Virksomhed registreret på adressen (${profile.cvr.registreredeVirksomheder.map((v) => `${v.navn} CVR ${v.cvrNummer}`).join(", ")})` : "Ingen aktive CVR-virksomheder registreret på adressen"}
-
----
-
-### Trin 2: Verificerede Nøgleoplysninger (Uden Gæt)
-* **Hovedbygning (BBR):** Opført **${profile.bbr.opfoerelsesaar ?? "Ikke registreret"}**${profile.bbr.ombygningsaar ? ` (om-/tilbygget ${profile.bbr.ombygningsaar})` : ""}, boligareal **${profile.bbr.boligarealM2 || "—"} m²**, bebygget areal hovedhus **${profile.bbr.bebyggetArealHovedbygningM2 || "—"} m²**, kælder **${profile.bbr.kaelderArealM2 || 0} m²**, tag: **${profile.bbr.tagmaterialeTekst}**, varme: **${profile.bbr.varmeinstallationTekst} (${profile.bbr.opvarmningsmiddelTekst})**.
-* **Sekundære bygninger i BBR:** ${secList || "Ingen sekundære bygninger registreret i BBR"} (Samlet bebygget areal i BBR: **${profile.bbr.samletBebyggetArealM2 || "—"} m²**).
-* **BBR Tekniske Anlæg & Byggesager:**
-  - \`BBR_TekniskAnlaeg\`: ${olieList}
-  - \`BBR_Byggesag\`: ${byggesagList}
-  - \`BBR_Grund\`: ${profile.bbr.aflobsforholdTekst}
-* **Plandata & Bebyggelsesprocent:** Faktisk bebyggelsesprocent (BR18): **${profile.plandata.faktiskBebyggelsesprocent}%** | Tilladt ramme: **${profile.plandata.tilladtBebyggelsesprocent}%**.
-
----
-
-### Trin 3: Krydsrevision mellem Uploadede Dokumenter og Registre
+### Trin 1: Aktiv Dokument-, Billed- & Plantegningskontrol (${fileNames.length} fil(er))
 ${
-  parsedTingbog.fundetTingbog
-    ? `* **Tingbogsattest (udtrukket fra uploadet dokument):** Samlede tinglyste hæftelser på **${parsedTingbog.samletHaeftelseDkk.toLocaleString("da-DK")} kr.** (${parsedTingbog.haeftelser.length} hæftelser) og **${parsedTingbog.servitutter.length} servitutter**.`
-    : `* **Tingbogsattest:** Ikke uploadet endnu. Upload Tingbogsattest i Dokumentrummet for faktuel kontrol af hæftelser, adkomst og servitutter.`
+  docChecks.length > 0
+    ? docChecks
+        .map(
+          (c) =>
+            `* **${c.fileName} (${c.kategori}) – [${c.status.toUpperCase()}]:** ${c.fundOverskrift}\n  ${c.fundDetaljer.map((d) => `- ${d}`).join("\n  ")}`
+        )
+        .join("\n")
+    : "* Ingen sagsdokumenter uploadet endnu – rapporten nedenfor viser verificerede offentlige registerfakta."
 }
-* **BBR- og Byggesagskontrol:** Sammenhold BBR-arealerne (${profile.bbr.samletBebyggetArealM2 || "—"} m² samlet bebygget areal) med kommunens byggesagsarkiv ved upload af byggetegninger.
 
----
-
-### Trin 4: Faktabaserede Observanda
 ${
-  criticalFlags.length > 0
-    ? criticalFlags.map((f) => `- 🔴 **KRITISK (${f.register}): ${f.title}** – ${f.description}`).join("\n")
-    : "- 🟢 **Ingen kritiske registerkonflikter registreret i de offentlige tabeller**"
+  floorplanCheck
+    ? `\n### Trin 2: Plantegnings- & Arealberegning (L×B inkl. 10 cm indervæg & 35 cm ydervæg)\n* **Status:** ${
+        floorplanCheck.indenfor15ProcentTolerance ? "🟢 GODKENDT (Inden for ±15 % BBR-tolerance)" : "🔴 AFVIGELSE OVER 15 % MOD BBR"
+      }\n* **Beregning:** ${floorplanCheck.konklusionTekst}`
+    : ""
 }
-${warningFlags.map((f) => `- 🟡 **OBS (${f.register}): ${f.title}** – ${f.description}`).join("\n")}
-${infoFlags.map((f) => `- ⚪ **FAKTA (${f.register}): ${f.title}** – ${f.description}`).join("\n")}
 
 ---
 
-### Trin 5: Juridisk Konsekvensvurdering
-${profile.roedeFlag.map((f) => `* **${f.title}:** ${f.legalImplication}`).join("\n") || "* Ingen kritiske anmærkninger i offentlige registre."}
-
----
-
-### Trin 6: Klausuler til Købsaftalens Afsnit 11
-${profile.afsnit11Klausuler
-  .map((k, idx) => `**${idx + 1}. ${k.titel} (${k.kildeRegister}):**\n> *"${k.tekst}"*`)
-  .join("\n\n")}
-
----
-
-### Trin 7: Faktabaserede Spørgsmål til Sælger
-${profile.saelgerSpoergsmaal
-  .map((q, idx) => `${idx + 1}. **${q.category}:** *${q.text}*`)
-  .join("\n")}
+### Trin 3: Verificerede Nøgleoplysninger (5 Autoritative Registre)
+* **BBR Hovedbygning:** Opført **${bbr.opfoerelsesaar ?? "—"}**${bbr.ombygningsaar ? ` (om-/tilbygget ${bbr.ombygningsaar})` : ""}, Boligareal **${bbr.boligarealM2} m²**, Bebygget areal **${bbr.bebyggetArealHovedbygningM2} m²** (samlet bebygget **${bbr.samletBebyggetArealM2} m²**), Tag: **${bbr.tagmaterialeTekst}**, Ydervæg: **${bbr.ydervaegTekst}**, Varme: **${bbr.varmeinstallationTekst}**.
+* **Matriklen (MAT/v2):** Grundareal **${mat.registreretArealM2} m²**, Fredskov **${mat.fredskovArealM2} m²**, Strandbeskyttelse **${mat.strandbeskyttelseArealM2} m²**, Jordforurening: **${mat.jordforureningStatus}**.
+* **Plandata.dk:** ${plan.lokalplanId ? `Lokalplan nr. ${plan.lokalplanId} (${plan.lokalplanNavn})` : `Ingen særskilt lokalplan (${plan.kommuneplanNavn})`}, Zonestatus: **${plan.zonestatus}**, Bebyggelsesprocent **${plan.faktiskBebyggelsesprocent} %**.
+* **Tingbog & Vurdering:** Offentlig ejendomsværdi **${profile.tingbog.offentligEjendomsvaerdiDkk ? `${profile.tingbog.offentligEjendomsvaerdiDkk.toLocaleString("da-DK")} kr.` : "Se Vurderingsportalen"}**${parsedTingbog.fundetTingbog ? ` · Tingbogsattest aflæst (${parsedTingbog.servitutter.length} servitut-noter)` : ""}.
 `;
 }
 
@@ -135,7 +280,7 @@ export async function POST(request: Request) {
     const caseIdParam = String(formData.get("caseId") || "").trim();
     addressForLock = address;
 
-    const files = formData.getAll("files") as File[];
+    const incomingFiles = formData.getAll("files") as File[];
 
     // 1. Hent altid den fulde 5-register profil (kun hårde fakta)
     const profile = await fetchFullPropertyProfile({ address });
@@ -143,16 +288,17 @@ export async function POST(request: Request) {
     const resolvedCaseId = caseIdParam || makeCaseId(agentEmail, profile.adresse);
     const existingCase = getSellerCase(resolvedCaseId);
 
-    // 2. Læs fil-buffers og udtræk rå tekst til Tingbog/Byggesag parser + SHA-256 hash
+    // 2. Gem nye filer på disk og indlæs evt. tidligere gemte filer på sagen
     const fileNames: string[] = [];
     const shaParts: (string | Buffer)[] = [Buffer.from(profile.adresse, "utf8")];
     let combinedRawText = "";
+    const rawTextsByFile: Record<string, string> = {};
     const fileParts: Array<{ inlineData: { data: string; mimeType: string } }> = [];
     const nowTime = new Date().toLocaleTimeString("da-DK", { hour: "2-digit", minute: "2-digit" });
     const newDocMetas = [...(existingCase.uploadedDocMeta || [])];
     const resolvedReminders = new Set(existingCase.resolvedReminderIds || []);
 
-    for (const file of files) {
+    for (const file of incomingFiles) {
       fileNames.push(file.name);
       const arrayBuffer = await file.arrayBuffer();
       const buffer = Buffer.from(arrayBuffer);
@@ -160,19 +306,34 @@ export async function POST(request: Request) {
 
       const utf8Extract = buffer.toString("utf8");
       const latin1Extract = buffer.toString("latin1");
-      combinedRawText += `\n--- FIL: ${file.name} ---\n` + utf8Extract.slice(0, 40000) + "\n" + latin1Extract.slice(0, 20000);
+      const fileText = utf8Extract.slice(0, 40000) + "\n" + latin1Extract.slice(0, 20000);
+      rawTextsByFile[file.name] = fileText;
+      combinedRawText += `\n--- FIL: ${file.name} ---\n` + fileText;
 
       const matchedRem = detectReminderMatchFromFilename(file.name);
       if (matchedRem) {
         resolvedReminders.add(matchedRem);
       }
 
-      if (!newDocMetas.some((m) => m.name === file.name)) {
+      const isImage = file.type.startsWith("image/") || /\.(png|jpg|jpeg|webp)$/i.test(file.name);
+      const existingMeta = newDocMetas.find((m) => m.name === file.name);
+      const docId = existingMeta?.id || `doc-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+
+      saveUploadedFileToDisk(
+        resolvedCaseId,
+        docId,
+        file.name,
+        file.type || (isImage ? "image/png" : "application/pdf"),
+        buffer
+      );
+
+      if (!existingMeta) {
         newDocMetas.push({
-          id: `doc-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          id: docId,
           name: file.name,
           sizeKb: Math.max(1, Math.round(file.size / 1024)),
-          type: file.type.startsWith("image/") ? "photo" : "document",
+          type: isImage ? "photo" : "document",
+          mimeType: file.type || (isImage ? "image/png" : "application/pdf"),
           uploadedAt: nowTime,
           matchedReminderId: matchedRem,
         });
@@ -181,9 +342,27 @@ export async function POST(request: Request) {
       fileParts.push({
         inlineData: {
           data: buffer.toString("base64"),
-          mimeType: file.type || "application/pdf",
+          mimeType: file.type || (isImage ? "image/png" : "application/pdf"),
         },
       });
+    }
+
+    // Hvis brugeren klikkede "Genkør AI-kontrol" uden at vedhæfte nye filer i dette kald, hent gemte filer fra disk
+    if (incomingFiles.length === 0) {
+      const diskFiles = listUploadedFilesFromDisk(resolvedCaseId);
+      for (const df of diskFiles) {
+        fileNames.push(df.fileName);
+        shaParts.push(df.buffer);
+        const fileText = df.buffer.toString("utf8").slice(0, 40000);
+        rawTextsByFile[df.fileName] = fileText;
+        combinedRawText += `\n--- FIL: ${df.fileName} ---\n` + fileText;
+        fileParts.push({
+          inlineData: {
+            data: df.buffer.toString("base64"),
+            mimeType: df.mimeType,
+          },
+        });
+      }
     }
 
     const parsedTingbog = parseDocumentTextForTingbog(combinedRawText);
@@ -191,11 +370,43 @@ export async function POST(request: Request) {
       resolvedReminders.add("rem-tingbogsattest");
     }
 
+    let floorplanCheck: FloorplanCalculation | null =
+      extractFloorplanFromRawText(combinedRawText, fileNames, profile.bbr.boligarealM2) ||
+      existingCase.floorplanCheck ||
+      null;
+
+    if (floorplanCheck) {
+      resolvedReminders.add("rem-byggesag");
+    }
+
     const sha256Key = computePayloadSha256(shaParts);
 
     // 3. Tjek SHA-256 Dokument-Cache (0,00 kr.)
-    const cachedAnalysis = getCachedAiAnalysis(sha256Key, "vejle-maegleren");
-    if (cachedAnalysis) {
+    const cachedRaw = getCachedAiAnalysis(sha256Key, "vejle-maegleren");
+    if (cachedRaw) {
+      let cachedReport = cachedRaw;
+      let cachedChecks: CaseDocumentCheckItem[] = buildDeterministicChecksForFiles(
+        newDocMetas,
+        rawTextsByFile,
+        profile,
+        parsedTingbog,
+        floorplanCheck
+      );
+      try {
+        const parsedCache = JSON.parse(cachedRaw);
+        if (parsedCache && parsedCache.markdownReport) {
+          cachedReport = parsedCache.markdownReport;
+          if (Array.isArray(parsedCache.documentChecks) && parsedCache.documentChecks.length > 0) {
+            cachedChecks = parsedCache.documentChecks;
+          }
+          if (parsedCache.floorplanCheck) {
+            floorplanCheck = parsedCache.floorplanCheck;
+          }
+        }
+      } catch {
+        // Ældre tekst-cache
+      }
+
       const updatedCase = upsertSellerCase({
         id: resolvedCaseId,
         agentEmail,
@@ -203,13 +414,17 @@ export async function POST(request: Request) {
         address: profile.adresse,
         profile,
         uploadedDocMeta: newDocMetas,
+        documentChecks: cachedChecks,
+        floorplanCheck,
         resolvedReminderIds: Array.from(resolvedReminders),
-        analysisReport: cachedAnalysis,
+        analysisReport: cachedReport,
       });
       return NextResponse.json({
-        analysis: cachedAnalysis,
+        analysis: cachedReport,
         cached: true,
         parsedTingbog,
+        documentChecks: updatedCase.documentChecks,
+        floorplanCheck: updatedCase.floorplanCheck,
         profile,
         sellerCase: updatedCase,
         budget: getTenantBudgetState("vejle-maegleren"),
@@ -217,17 +432,39 @@ export async function POST(request: Request) {
     }
 
     // 4. Tjek intern 30,00 kr./dag & 3,00 kr./sag AI-budgetlås (Zero-Limbo)
-    const estimatedCost = Math.max(COST_PER_DOC_ANALYSIS_DKK, files.length * 0.05);
+    const estimatedCost = Math.max(COST_PER_DOC_ANALYSIS_DKK, Math.max(1, fileParts.length) * 0.05);
     const budgetCheck = checkAndReserveAiBudget({
       tenantId: "vejle-maegleren",
       caseKey: profile.adresse,
       estimatedCostDkk: estimatedCost,
     });
 
-    if (!budgetCheck.allowed || !process.env.GEMINI_API_KEY || files.length === 0) {
+    let finalChecks = buildDeterministicChecksForFiles(
+      newDocMetas,
+      rawTextsByFile,
+      profile,
+      parsedTingbog,
+      floorplanCheck
+    );
+
+    if (!budgetCheck.allowed || !process.env.GEMINI_API_KEY || fileParts.length === 0) {
       releaseInFlightLock(profile.adresse);
-      const report = buildDeterministic7StepReport(profile, fileNames, parsedTingbog);
-      setCachedAiAnalysis(sha256Key, report, profile.adresse);
+      const report = buildDeterministic7StepReport(
+        profile,
+        fileNames,
+        parsedTingbog,
+        finalChecks,
+        floorplanCheck
+      );
+      setCachedAiAnalysis(
+        sha256Key,
+        JSON.stringify({
+          markdownReport: report,
+          documentChecks: finalChecks,
+          floorplanCheck,
+        }),
+        profile.adresse
+      );
       const updatedCase = upsertSellerCase({
         id: resolvedCaseId,
         agentEmail,
@@ -235,6 +472,8 @@ export async function POST(request: Request) {
         address: profile.adresse,
         profile,
         uploadedDocMeta: newDocMetas,
+        documentChecks: finalChecks,
+        floorplanCheck,
         resolvedReminderIds: Array.from(resolvedReminders),
         analysisReport: report,
       });
@@ -242,6 +481,8 @@ export async function POST(request: Request) {
         analysis: report,
         deterministicFallback: true,
         parsedTingbog,
+        documentChecks: updatedCase.documentChecks,
+        floorplanCheck: updatedCase.floorplanCheck,
         profile,
         sellerCase: updatedCase,
         budget: budgetCheck.state,
@@ -253,18 +494,16 @@ export async function POST(request: Request) {
 
     const registerContextPrompt = `
 VERIFICEREDE REGISTERDATA FOR ${profile.adresse.toUpperCase()} (KUN HÅRDE FAKTA - GÆT ALDRIG):
-- BBR Hovedbygning: Opført ${profile.bbr.opfoerelsesaar ?? "ukendt"}, Boligareal ${profile.bbr.boligarealM2 || "ukendt"} m², Bebygget areal hovedhus ${profile.bbr.bebyggetArealHovedbygningM2 || "ukendt"} m², Tag: ${profile.bbr.tagmaterialeTekst}, Varme: ${profile.bbr.varmeinstallationTekst}
+- BBR Hovedbygning: Opført ${profile.bbr.opfoerelsesaar ?? "ukendt"}, Boligareal ${profile.bbr.boligarealM2 || "ukendt"} m², Bebygget areal hovedhus ${profile.bbr.bebyggetArealHovedbygningM2 || "ukendt"} m², Tag: ${profile.bbr.tagmaterialeTekst}, Ydervæg: ${profile.bbr.ydervaegTekst}, Varme: ${profile.bbr.varmeinstallationTekst}, Etager: ${profile.bbr.antalEtager}
 - BBR Sekundære bygninger: ${JSON.stringify(profile.bbr.sekundaereBygninger)}
 - BBR TekniskAnlaeg: ${JSON.stringify(profile.bbr.tekniskeAnlaeg)}
 - BBR Byggesag: ${JSON.stringify(profile.bbr.byggesager)}
-- BBR Afløb: ${profile.bbr.aflobsforholdTekst}
 - Matriklen (MAT/v2): Grundareal ${profile.matrikel.registreretArealM2} m², Matrikelnr. ${profile.matrikel.matrikelnummer}
 - Plandata.dk WFS: ${JSON.stringify(profile.plandata)}
-- Offentlig Vurdering & Tinglyste Handler: ${JSON.stringify(profile.tingbog)}
-- CVR på adressen: ${JSON.stringify(profile.cvr.registreredeVirksomheder)}
 - Tingbogs-udtræk fra uploadede filer: ${JSON.stringify(parsedTingbog)}
 
-Analysér de vedhæftede dokumenter (${fileNames.join(", ")}) op imod ovenstående verificerede registerdata uden nogen form for gætteri:
+Uploadede filer til aktiv kontrol (${fileNames.join(", ")}).
+Analysér hver enkelt fil/foto/plantegning op imod BBR, Byggesag og Tingbog, og returnér JSON med documentChecks, floorplanDetected og markdownSummary:
 `;
 
     const parts: any[] = [{ text: registerContextPrompt }, ...fileParts];
@@ -275,9 +514,10 @@ Analysér de vedhæftede dokumenter (${fileNames.join(", ")}) op imod ovenståen
         model: LOCKED_FLASH_MODEL,
         contents: [{ role: "user", parts }],
         config: {
-          systemInstruction: BOLIGHANDEL_GPT_SYSTEM_PROMPT,
+          systemInstruction: BOLIGHANDEL_ANALYSIS_SYSTEM_PROMPT,
           temperature: 0.0,
           maxOutputTokens: 2048,
+          responseMimeType: "application/json",
           thinkingConfig: { thinkingBudget: 512 },
         },
       })
@@ -294,14 +534,98 @@ Analysér de vedhæftede dokumenter (${fileNames.join(", ")}) op imod ovenståen
       usageMetadata: aiResponse?.usageMetadata,
     });
 
+    let aiSummaryMarkdown = "";
+    if (aiResponse && aiResponse.text) {
+      try {
+        const parsedJson = JSON.parse(aiResponse.text);
+        if (
+          parsedJson.floorplanDetected &&
+          parsedJson.floorplanDetected.isFloorplan &&
+          (Number(parsedJson.floorplanDetected.indvendigLaengdeM) > 0 ||
+            (Array.isArray(parsedJson.floorplanDetected.rumListe) &&
+              parsedJson.floorplanDetected.rumListe.length > 0))
+        ) {
+          floorplanCheck = calculateFloorplanVsBbr({
+            sourceFileName:
+              parsedJson.floorplanDetected.sourceFileName ||
+              fileNames.find((f) => /plan|tegning/i.test(f)) ||
+              fileNames[0] ||
+              "Plantegning",
+            indvendigLaengdeM: Number(parsedJson.floorplanDetected.indvendigLaengdeM) || 0,
+            indvendigBreddeM: Number(parsedJson.floorplanDetected.indvendigBreddeM) || 0,
+            antalIndervaegge: Number(parsedJson.floorplanDetected.antalIndervaegge ?? 5),
+            indervaegTykkelseCm: 10,
+            ydervaegTykkelseCm: 35,
+            rumListe: parsedJson.floorplanDetected.rumListe,
+            bbrBoligarealM2: profile.bbr.boligarealM2,
+            isDetected: true,
+          });
+          resolvedReminders.add("rem-byggesag");
+        }
+
+        if (Array.isArray(parsedJson.documentChecks) && parsedJson.documentChecks.length > 0) {
+          const aiChecksByFile = new Map<string, any>();
+          for (const c of parsedJson.documentChecks) {
+            if (c && c.fileName) {
+              aiChecksByFile.set(String(c.fileName).toLowerCase(), c);
+            }
+          }
+
+          finalChecks = finalChecks.map((detCheck) => {
+            const aiMatch = aiChecksByFile.get(detCheck.fileName.toLowerCase());
+            if (!aiMatch) return detCheck;
+            return {
+              id: detCheck.id,
+              fileName: detCheck.fileName,
+              fileType:
+                aiMatch.fileType === "floorplan" ||
+                aiMatch.fileType === "photo" ||
+                aiMatch.fileType === "document"
+                  ? aiMatch.fileType
+                  : detCheck.fileType,
+              checkedAt: nowTime,
+              status:
+                aiMatch.status === "afvigelse" ||
+                aiMatch.status === "opmaerksomhed" ||
+                aiMatch.status === "ok"
+                  ? aiMatch.status
+                  : detCheck.status,
+              kategori: aiMatch.kategori || detCheck.kategori,
+              fundOverskrift: aiMatch.fundOverskrift || detCheck.fundOverskrift,
+              fundDetaljer:
+                Array.isArray(aiMatch.fundDetaljer) && aiMatch.fundDetaljer.length > 0
+                  ? aiMatch.fundDetaljer.map(String)
+                  : detCheck.fundDetaljer,
+              afsnit11Forslag:
+                aiMatch.afsnit11Forslag !== undefined
+                  ? aiMatch.afsnit11Forslag
+                  : detCheck.afsnit11Forslag,
+            };
+          });
+        }
+
+        if (typeof parsedJson.markdownSummary === "string") {
+          aiSummaryMarkdown = parsedJson.markdownSummary;
+        }
+      } catch {
+        aiSummaryMarkdown = aiResponse.text;
+      }
+    }
+
     const finalReport =
-      aiResponse && aiResponse.text
-        ? aiResponse.text
-        : buildDeterministic7StepReport(profile, fileNames, parsedTingbog);
+      buildDeterministic7StepReport(profile, fileNames, parsedTingbog, finalChecks, floorplanCheck) +
+      (aiSummaryMarkdown ? `\n\n---\n\n### Supplerende AI-Revision\n${aiSummaryMarkdown}` : "");
 
-    setCachedAiAnalysis(sha256Key, finalReport, profile.adresse);
+    setCachedAiAnalysis(
+      sha256Key,
+      JSON.stringify({
+        markdownReport: finalReport,
+        documentChecks: finalChecks,
+        floorplanCheck,
+      }),
+      profile.adresse
+    );
 
-    // Tilføj kort statusbesked til sagens assistentlog
     const tempCaseForMissing = {
       ...existingCase,
       uploadedDocMeta: newDocMetas,
@@ -309,12 +633,13 @@ Analysér de vedhæftede dokumenter (${fileNames.join(", ")}) op imod ovenståen
       profileSnapshot: profile,
     };
     const stillMissing = computeMissingRemindersForCase(tempCaseForMissing);
+    const findingsCount = finalChecks.filter((c) => c.status !== "ok").length;
     const docStatusSummary =
       stillMissing.length > 0
-        ? `Dokument tjekket (${fileNames.join(", ")}). Sagen mangler fortsat: ${stillMissing
+        ? `Kontrollerede ${fileNames.join(", ")} (${findingsCount > 0 ? `${findingsCount} opmærksomhedspunkt(er) fundet` : "ingen afvigelser"}). Sagen mangler fortsat: ${stillMissing
             .map((m) => m.titel.split("(")[0].trim())
             .join(", ")}.`
-        : `Dokument tjekket (${fileNames.join(", ")}). Alle anbefalede dokumentkategorier på sagen er nu dækket.`;
+        : `Kontrollerede ${fileNames.join(", ")}. Alle kernebilag på sagen er nu gennemgået og Afsnit 11-forslag er opdateret.`;
 
     const nextMessages = [
       ...(existingCase.assistantMessages || []),
@@ -323,7 +648,7 @@ Analysér de vedhæftede dokumenter (${fileNames.join(", ")}) op imod ovenståen
         sender: "ai" as const,
         text: docStatusSummary,
         createdAt: new Date().toISOString(),
-        actionsTaken: [`Analyserede ${fileNames.join(", ")}`],
+        actionsTaken: [`Kontrollerede ${fileNames.join(", ")}`],
       },
     ];
 
@@ -334,6 +659,8 @@ Analysér de vedhæftede dokumenter (${fileNames.join(", ")}) op imod ovenståen
       address: profile.adresse,
       profile,
       uploadedDocMeta: newDocMetas,
+      documentChecks: finalChecks,
+      floorplanCheck,
       resolvedReminderIds: Array.from(resolvedReminders),
       assistantMessages: nextMessages,
       analysisReport: finalReport,
@@ -342,6 +669,8 @@ Analysér de vedhæftede dokumenter (${fileNames.join(", ")}) op imod ovenståen
     return NextResponse.json({
       analysis: finalReport,
       parsedTingbog,
+      documentChecks: updatedCase.documentChecks,
+      floorplanCheck: updatedCase.floorplanCheck,
       profile,
       sellerCase: updatedCase,
       budget: finalBudget,

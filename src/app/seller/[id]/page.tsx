@@ -32,8 +32,13 @@ export default function SellerPortal() {
           const data = await res.json();
           setAddress(data.address || "H C Hansens Vej 29, 7100 Vejle");
           if (data.sellerName) setSellerName(data.sellerName);
+          if (data.skipSellerQuestionnaire) {
+            setIsCompleted(true);
+          }
           if (Array.isArray(data.dynamicQuestions) && data.dynamicQuestions.length > 0) {
-            setDynamicQuestions(data.dynamicQuestions);
+            const disabledSet = new Set(Array.isArray(data.disabledQuestionIds) ? data.disabledQuestionIds : []);
+            const activeQs = data.dynamicQuestions.filter((q: Question) => !disabledSet.has(q.id));
+            setDynamicQuestions(activeQs.length > 0 ? activeQs : data.dynamicQuestions);
           }
           if (data.answers) setAnswers(data.answers);
           if (data.followUpNotes) setFollowUpNotes(data.followUpNotes);
