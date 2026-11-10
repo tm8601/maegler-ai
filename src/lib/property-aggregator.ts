@@ -1889,7 +1889,10 @@ export function evaluateExactBuyerMatches(
 // ============================================================================
 // HOVEDFUNKTION: BYG 360° 5-REGISTER PROFIL UDEN GÆTTERI (100% HÅRDE FAKTA)
 // ============================================================================
-export async function buildFullPropertyProfile(addressQuery: string): Promise<PropertyFullProfile> {
+export async function buildFullPropertyProfile(
+  addressQuery: string,
+  hint?: { husnummerId?: string; lat?: number; lon?: number }
+): Promise<PropertyFullProfile> {
   const rawAddress = addressQuery.trim() || "H C Hansens Vej 29, 7100 Vejle";
   const parsedInit = parseAddressComponents(rawAddress);
 
@@ -1903,10 +1906,10 @@ export async function buildFullPropertyProfile(addressQuery: string): Promise<Pr
     null;
 
   let officialAddress = exactSug?.tekst || rawAddress;
-  let husnummerId = exactSug?.adresse?.adgangsadresseid || exactSug?.adresse?.id || "";
+  let husnummerId = hint?.husnummerId || exactSug?.adresse?.adgangsadresseid || exactSug?.adresse?.id || "";
   let adresseId = exactSug?.adresse?.id || husnummerId;
-  let lat = exactSug?.adresse?.lat || 55.7093;
-  let lon = exactSug?.adresse?.lon || 9.5357;
+  let lat = hint?.lat || exactSug?.adresse?.lat || 55.7093;
+  let lon = hint?.lon || exactSug?.adresse?.lon || 9.5357;
   let vejnavn = exactSug?.adresse?.vejnavn || parsedInit.vejnavn;
   let husnr = exactSug?.adresse?.husnr || parsedInit.husnr;
   let postnr = exactSug?.adresse?.postnr || parsedInit.postnr;
@@ -2268,7 +2271,7 @@ export async function buildFullPropertyProfile(addressQuery: string): Promise<Pr
                 tek024Etableringsaar
                 tek025Tilslutningsaar
                 tek026Stoerrelsesklasse
-                tek027 Placering
+                tek027Placering
                 tek033Driftstatus
               }
             }
@@ -2672,6 +2675,22 @@ export async function buildFullPropertyProfile(addressQuery: string): Promise<Pr
     });
   }
 
+  if (sekundaereBygninger.length > 0) {
+    const sekSummary = sekundaereBygninger
+      .map((s) => `Bygning ${s.bygningsnr}: ${s.typeTekst} (${s.arealM2} m²)`)
+      .join(", ");
+    roedeFlag.push({
+      id: "rf-sekundaer",
+      severity: "info",
+      register: "BBR",
+      title: `Sekundære bygninger i BBR (${sekundaereBygninger.length} stk.) – afstem med byggesag og skråfoto`,
+      description: `BBR registrerer følgende småbygninger på matriklen: ${sekSummary}. Afstem at samtlige småbygninger på luftfoto stemmer med BBR og kommunens byggesagsarkiv.`,
+      legalImplication:
+        "Sikrer at carport, garage, udhus og overdækninger på grunden er korrekt BBR-registreret inden annoncering.",
+      afsnit11Clause: `På ejendommen er der i BBR registreret sekundære bygninger (${sekSummary}). Køber er opfordret til at gennemgå BBR-meddelelsen sammenholdt med de faktiske forhold på grunden.`,
+    });
+  }
+
   if (cvrList.length > 0) {
     roedeFlag.push({
       id: "rf-cvr",
@@ -2964,7 +2983,13 @@ export type FullPropertyProfile = PropertyFullProfile;
 export async function fetchFullPropertyProfile(
   opts: string | { address: string; husnummerId?: string; lat?: number; lon?: number }
 ): Promise<PropertyFullProfile> {
-  const addr = typeof opts === "string" ? opts : opts.address;
-  return buildFullPropertyProfile(addr);
+  if (typeof opts === "string") {
+    return buildFullPropertyProfile(opts);
+  }
+  return buildFullPropertyProfile(opts.address, {
+    husnummerId: opts.husnummerId,
+    lat: opts.lat,
+    lon: opts.lon,
+  });
 }
 

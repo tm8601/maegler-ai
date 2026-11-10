@@ -11,13 +11,14 @@ export default function SellerPortal() {
   const params = useParams();
   const caseId = String(params?.id || "default");
 
-  const [address, setAddress] = useState("Kløvertoften 38, 7100 Vejle");
+  const [address, setAddress] = useState("Indlæser ejendom...");
   const [sellerName, setSellerName] = useState("Sælger");
   const [currentStep, setCurrentStep] = useState(0);
   const [answers, setAnswers] = useState<Record<string, boolean | string | string[]>>({});
   const [followUpNotes, setFollowUpNotes] = useState<Record<string, string>>({});
   const [showFollowUpFor, setShowFollowUpFor] = useState<string | null>(null);
   const [selectedMulti, setSelectedMulti] = useState<string[]>([]);
+  const [textAnswer, setTextAnswer] = useState("");
   const [isCompleted, setIsCompleted] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [generatedClauses, setGeneratedClauses] = useState<string[]>([]);
@@ -29,20 +30,39 @@ export default function SellerPortal() {
         const res = await fetch(`${getApiBaseUrl()}/api/cases?id=${encodeURIComponent(caseId)}`);
         if (res.ok) {
           const data = await res.json();
-          if (data.address) setAddress(data.address);
+          setAddress(data.address || "H C Hansens Vej 29, 7100 Vejle");
           if (data.sellerName) setSellerName(data.sellerName);
           if (Array.isArray(data.dynamicQuestions) && data.dynamicQuestions.length > 0) {
             setDynamicQuestions(data.dynamicQuestions);
           }
           if (data.answers) setAnswers(data.answers);
           if (data.followUpNotes) setFollowUpNotes(data.followUpNotes);
+        } else {
+          setAddress("H C Hansens Vej 29, 7100 Vejle");
         }
       } catch (e) {
         console.error("Failed to load seller case:", e);
+        setAddress("H C Hansens Vej 29, 7100 Vejle");
       }
     };
     loadCase();
   }, [caseId]);
+
+  useEffect(() => {
+    const q = dynamicQuestions[currentStep];
+    if (!q) return;
+    const existingAns = answers[q.id];
+    if (Array.isArray(existingAns)) {
+      setSelectedMulti(existingAns);
+    } else {
+      setSelectedMulti([]);
+    }
+    if (typeof existingAns === "string") {
+      setTextAnswer(existingAns);
+    } else {
+      setTextAnswer("");
+    }
+  }, [currentStep, dynamicQuestions, answers]);
 
   const finishAndSave = async (
     nextAnswers: Record<string, boolean | string | string[]>,
@@ -165,6 +185,19 @@ export default function SellerPortal() {
             <span className="text-xs text-slate-400 mr-2">
               Spørgsmål {currentStep + 1} af {dynamicQuestions.length}
             </span>
+            {currentStep > 0 && (
+              <button
+                type="button"
+                onClick={() => {
+                  setShowFollowUpFor(null);
+                  setCurrentStep((prev) => Math.max(0, prev - 1));
+                }}
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white/10 hover:bg-white/20 text-xs text-slate-200 mr-2 cursor-pointer"
+              >
+                <ArrowLeft size={12} />
+                Forrige
+              </button>
+            )}
             <div className="flex gap-1.5">
               {dynamicQuestions.map((q, i) => (
                 <div
@@ -209,7 +242,29 @@ export default function SellerPortal() {
                   {question.text}
                 </h2>
 
-                {question.type === "multiselect" && question.options ? (
+                {question.type === "text" ? (
+                  <div className="w-full max-w-xl space-y-4">
+                    <textarea
+                      rows={3}
+                      value={textAnswer}
+                      onChange={(e) => setTextAnswer(e.target.value)}
+                      placeholder="Skriv dit svar her..."
+                      className="w-full rounded-xl bg-slate-800 border border-slate-700 p-4 text-sm text-white outline-none focus:border-indigo-400"
+                    />
+                    <button
+                      onClick={() => {
+                        const nextAnswers = { ...answers, [question.id]: textAnswer };
+                        setAnswers(nextAnswers);
+                        advanceStep(nextAnswers, followUpNotes);
+                      }}
+                      disabled={isSaving}
+                      className="w-full py-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 font-semibold flex items-center justify-center gap-2 transition-colors"
+                    >
+                      Næste spørgsmål
+                      <ArrowRight size={18} />
+                    </button>
+                  </div>
+                ) : question.type === "multiselect" && question.options ? (
                   <div className="w-full max-w-xl space-y-4">
                     <div className="grid grid-cols-2 gap-3">
                       {question.options.map((opt) => {

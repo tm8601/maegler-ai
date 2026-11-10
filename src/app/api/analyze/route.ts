@@ -4,12 +4,22 @@ import {
   checkAndReserveAiBudget,
   computePayloadSha256,
   COST_PER_DOC_ANALYSIS_DKK,
+  finalizeAiCallUsage,
   getCachedAiAnalysis,
   getTenantBudgetState,
+  LOCKED_FLASH_MODEL,
+  releaseInFlightLock,
   setCachedAiAnalysis,
 } from "@/lib/ai-cost-guard";
 import { fetchFullPropertyProfile, PropertyFullProfile } from "@/lib/property-aggregator";
 import { parseDocumentTextForTingbog, ParsedTingbogSummary } from "@/lib/tingbog-parser";
+import {
+  computeMissingRemindersForCase,
+  detectReminderMatchFromFilename,
+  getSellerCase,
+  makeCaseId,
+  upsertSellerCase,
+} from "@/lib/case-store";
 
 const BOLIGHANDEL_GPT_SYSTEM_PROMPT = `
 Du er Bolighandel-GPT, en højt specialiseret juridisk analytiker i dansk ejendomsret (LOFE, Lov om forbrugerbeskyttelse ved erhvervelse af fast ejendom, Jordforureningsloven, BR18 og DE's etiske regler).
@@ -116,19 +126,31 @@ ${profile.saelgerSpoergsmaal
 }
 
 export async function POST(request: Request) {
+  let addressForLock = "default";
   try {
     const formData = await request.formData();
     const address = String(formData.get("address") || "H C Hansens Vej 29, 7100 Vejle").trim();
+    const agentEmail = String(formData.get("agentEmail") || "tobias@vejlemaegleren.dk").trim();
+    const agentName = String(formData.get("agentName") || "Tobias Meng").trim();
+    const caseIdParam = String(formData.get("caseId") || "").trim();
+    addressForLock = address;
+
     const files = formData.getAll("files") as File[];
 
     // 1. Hent altid den fulde 5-register profil (kun hårde fakta)
     const profile = await fetchFullPropertyProfile({ address });
+    addressForLock = profile.adresse;
+    const resolvedCaseId = caseIdParam || makeCaseId(agentEmail, profile.adresse);
+    const existingCase = getSellerCase(resolvedCaseId);
 
     // 2. Læs fil-buffers og udtræk rå tekst til Tingbog/Byggesag parser + SHA-256 hash
     const fileNames: string[] = [];
-    const shaParts: (string | Buffer)[] = [Buffer.from(address, "utf8")];
+    const shaParts: (string | Buffer)[] = [Buffer.from(profile.adresse, "utf8")];
     let combinedRawText = "";
     const fileParts: Array<{ inlineData: { data: string; mimeType: string } }> = [];
+    const nowTime = new Date().toLocaleTimeString("da-DK", { hour: "2-digit", minute: "2-digit" });
+    const newDocMetas = [...(existingCase.uploadedDocMeta || [])];
+    const resolvedReminders = new Set(existingCase.resolvedReminderIds || []);
 
     for (const file of files) {
       fileNames.push(file.name);
@@ -140,6 +162,22 @@ export async function POST(request: Request) {
       const latin1Extract = buffer.toString("latin1");
       combinedRawText += `\n--- FIL: ${file.name} ---\n` + utf8Extract.slice(0, 40000) + "\n" + latin1Extract.slice(0, 20000);
 
+      const matchedRem = detectReminderMatchFromFilename(file.name);
+      if (matchedRem) {
+        resolvedReminders.add(matchedRem);
+      }
+
+      if (!newDocMetas.some((m) => m.name === file.name)) {
+        newDocMetas.push({
+          id: `doc-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          name: file.name,
+          sizeKb: Math.max(1, Math.round(file.size / 1024)),
+          type: file.type.startsWith("image/") ? "photo" : "document",
+          uploadedAt: nowTime,
+          matchedReminderId: matchedRem,
+        });
+      }
+
       fileParts.push({
         inlineData: {
           data: buffer.toString("base64"),
@@ -149,42 +187,68 @@ export async function POST(request: Request) {
     }
 
     const parsedTingbog = parseDocumentTextForTingbog(combinedRawText);
+    if (parsedTingbog.fundetTingbog) {
+      resolvedReminders.add("rem-tingbogsattest");
+    }
+
     const sha256Key = computePayloadSha256(shaParts);
 
-    // 3. Tjek SHA-256 Dokument-Cache
+    // 3. Tjek SHA-256 Dokument-Cache (0,00 kr.)
     const cachedAnalysis = getCachedAiAnalysis(sha256Key, "vejle-maegleren");
     if (cachedAnalysis) {
-      const budgetState = getTenantBudgetState("vejle-maegleren");
+      const updatedCase = upsertSellerCase({
+        id: resolvedCaseId,
+        agentEmail,
+        agentName,
+        address: profile.adresse,
+        profile,
+        uploadedDocMeta: newDocMetas,
+        resolvedReminderIds: Array.from(resolvedReminders),
+        analysisReport: cachedAnalysis,
+      });
       return NextResponse.json({
         analysis: cachedAnalysis,
         cached: true,
         parsedTingbog,
         profile,
-        budget: budgetState,
+        sellerCase: updatedCase,
+        budget: getTenantBudgetState("vejle-maegleren"),
       });
     }
 
-    // 4. Tjek intern 30,00 kr./dag AI-budgetlås (backend)
-    const estimatedCost = Math.max(COST_PER_DOC_ANALYSIS_DKK, files.length * 0.06);
+    // 4. Tjek intern 30,00 kr./dag & 3,00 kr./sag AI-budgetlås (Zero-Limbo)
+    const estimatedCost = Math.max(COST_PER_DOC_ANALYSIS_DKK, files.length * 0.05);
     const budgetCheck = checkAndReserveAiBudget({
       tenantId: "vejle-maegleren",
-      caseKey: address,
+      caseKey: profile.adresse,
       estimatedCostDkk: estimatedCost,
     });
 
     if (!budgetCheck.allowed || !process.env.GEMINI_API_KEY || files.length === 0) {
+      releaseInFlightLock(profile.adresse);
       const report = buildDeterministic7StepReport(profile, fileNames, parsedTingbog);
-      setCachedAiAnalysis(sha256Key, report, address);
+      setCachedAiAnalysis(sha256Key, report, profile.adresse);
+      const updatedCase = upsertSellerCase({
+        id: resolvedCaseId,
+        agentEmail,
+        agentName,
+        address: profile.adresse,
+        profile,
+        uploadedDocMeta: newDocMetas,
+        resolvedReminderIds: Array.from(resolvedReminders),
+        analysisReport: report,
+      });
       return NextResponse.json({
         analysis: report,
         deterministicFallback: true,
         parsedTingbog,
         profile,
+        sellerCase: updatedCase,
         budget: budgetCheck.state,
       });
     }
 
-    // 5. Kald Gemini 2.5 Flash med 25-sekunders timeout når der er uploadet dokumenter
+    // 5. Kald Gemini 2.5 Flash med hård 18-sekunders timeout og 0 retries (Zero-Limbo!)
     const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
     const registerContextPrompt = `
@@ -205,14 +269,16 @@ Analysér de vedhæftede dokumenter (${fileNames.join(", ")}) op imod ovenståen
 
     const parts: any[] = [{ text: registerContextPrompt }, ...fileParts];
 
-    const timeoutPromise = new Promise<null>((resolve) => setTimeout(() => resolve(null), 25000));
+    const timeoutPromise = new Promise<null>((resolve) => setTimeout(() => resolve(null), 18000));
     const aiPromise = ai.models
       .generateContent({
-        model: "gemini-2.5-flash",
+        model: LOCKED_FLASH_MODEL,
         contents: [{ role: "user", parts }],
         config: {
           systemInstruction: BOLIGHANDEL_GPT_SYSTEM_PROMPT,
           temperature: 0.0,
+          maxOutputTokens: 2048,
+          thinkingConfig: { thinkingBudget: 512 },
         },
       })
       .catch((err) => {
@@ -221,20 +287,67 @@ Analysér de vedhæftede dokumenter (${fileNames.join(", ")}) op imod ovenståen
       });
 
     const aiResponse = await Promise.race([aiPromise, timeoutPromise]);
+    const finalBudget = finalizeAiCallUsage({
+      tenantId: "vejle-maegleren",
+      caseKey: profile.adresse,
+      reservedDkk: budgetCheck.reservedDkk,
+      usageMetadata: aiResponse?.usageMetadata,
+    });
+
     const finalReport =
       aiResponse && aiResponse.text
         ? aiResponse.text
         : buildDeterministic7StepReport(profile, fileNames, parsedTingbog);
 
-    setCachedAiAnalysis(sha256Key, finalReport, address);
+    setCachedAiAnalysis(sha256Key, finalReport, profile.adresse);
+
+    // Tilføj kort statusbesked til sagens assistentlog
+    const tempCaseForMissing = {
+      ...existingCase,
+      uploadedDocMeta: newDocMetas,
+      resolvedReminderIds: Array.from(resolvedReminders),
+      profileSnapshot: profile,
+    };
+    const stillMissing = computeMissingRemindersForCase(tempCaseForMissing);
+    const docStatusSummary =
+      stillMissing.length > 0
+        ? `Dokument tjekket (${fileNames.join(", ")}). Sagen mangler fortsat: ${stillMissing
+            .map((m) => m.titel.split("(")[0].trim())
+            .join(", ")}.`
+        : `Dokument tjekket (${fileNames.join(", ")}). Alle anbefalede dokumentkategorier på sagen er nu dækket.`;
+
+    const nextMessages = [
+      ...(existingCase.assistantMessages || []),
+      {
+        id: `msg-doc-${Date.now()}`,
+        sender: "ai" as const,
+        text: docStatusSummary,
+        createdAt: new Date().toISOString(),
+        actionsTaken: [`Analyserede ${fileNames.join(", ")}`],
+      },
+    ];
+
+    const updatedCase = upsertSellerCase({
+      id: resolvedCaseId,
+      agentEmail,
+      agentName,
+      address: profile.adresse,
+      profile,
+      uploadedDocMeta: newDocMetas,
+      resolvedReminderIds: Array.from(resolvedReminders),
+      assistantMessages: nextMessages,
+      analysisReport: finalReport,
+    });
 
     return NextResponse.json({
       analysis: finalReport,
       parsedTingbog,
       profile,
-      budget: getTenantBudgetState("vejle-maegleren"),
+      sellerCase: updatedCase,
+      budget: finalBudget,
     });
   } catch (error: any) {
+    releaseInFlightLock(addressForLock);
     console.error("AI Analysis error:", error);
     return NextResponse.json({ error: error.message || "Fejl under analyse" }, { status: 500 });
   }

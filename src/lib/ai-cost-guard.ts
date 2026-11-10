@@ -6,14 +6,25 @@ const DATA_DIR = process.env.DATA_DIR || "/tmp/maegler-ai-data";
 const LEDGER_FILE = path.join(DATA_DIR, "ai-budget-ledger.json");
 const DOC_CACHE_FILE = path.join(DATA_DIR, "ai-doc-cache.json");
 
-// Hård daglig grænse på 30,00 kr. som ALDRIG må overstiges!
+// Hård daglig grænse på 30,00 kr. og sagsloft på 3,00 kr. (Zero-Limbo)
 export const MAX_DAILY_AI_BUDGET_DKK = Number(process.env.MAX_DAILY_AI_BUDGET_DKK || 30.0);
-export const MAX_CASE_AI_BUDGET_DKK = Number(process.env.MAX_CASE_AI_BUDGET_DKK || 2.5);
+export const MAX_CASE_AI_BUDGET_DKK = Number(process.env.MAX_CASE_AI_BUDGET_DKK || 3.0);
 export const ALLOW_PRO_MODELS = process.env.ALLOW_PRO_MODELS === "true";
+export const LOCKED_FLASH_MODEL = "gemini-2.5-flash";
+export const USD_TO_DKK_RATE = 7.0;
 
-// Konservative priser i DKK inkl. sikkerhedsmargin for Gemini 2.5 Flash
+// Konservative priser pr. 1M tokens i USD (svarende til Servitut AI case_budget_tracker.py)
+const FLASH_INPUT_USD_PER_1M = 0.75;
+const FLASH_CACHED_USD_PER_1M = 0.075;
+const FLASH_OUTPUT_USD_PER_1M = 3.75;
+
+// Konservative pre-flight estimater i DKK
 export const COST_PER_DOC_ANALYSIS_DKK = 0.08;
-export const COST_PER_TEXT_CHECK_DKK = 0.03;
+export const COST_PER_ASSISTANT_TURN_DKK = 0.03;
+
+// In-memory concurrency guard for at forhindre enhver form for "limbo" eller parallelle loops
+const activeCaseCalls = new Map<string, number>();
+const MAX_ASSISTANT_CALLS_PER_CASE_SESSION = 15;
 
 export interface TenantBudgetState {
   tenantId: string;
@@ -25,7 +36,10 @@ export interface TenantBudgetState {
   callsToday: number;
   cacheHitsToday: number;
   blockedCallsToday: number;
+  inputTokensToday: number;
+  outputTokensToday: number;
   caseSpendByKey: Record<string, number>;
+  caseCallsByKey: Record<string, number>;
   lastModelUsed: string | null;
   lastCallAt: string | null;
   lastError: string | null;
@@ -84,6 +98,9 @@ export function getTenantBudgetState(tenantId = "vejle-maegleren"): TenantBudget
   if (existing && existing.date === today) {
     existing.maxDailyBudgetDkk = MAX_DAILY_AI_BUDGET_DKK;
     existing.maxCaseBudgetDkk = MAX_CASE_AI_BUDGET_DKK;
+    existing.inputTokensToday = Number(existing.inputTokensToday || 0);
+    existing.outputTokensToday = Number(existing.outputTokensToday || 0);
+    existing.caseCallsByKey = existing.caseCallsByKey || {};
     return existing;
   }
 
@@ -97,8 +114,11 @@ export function getTenantBudgetState(tenantId = "vejle-maegleren"): TenantBudget
     callsToday: 0,
     cacheHitsToday: 0,
     blockedCallsToday: 0,
+    inputTokensToday: 0,
+    outputTokensToday: 0,
     caseSpendByKey: {},
-    lastModelUsed: existing?.lastModelUsed || "gemini-2.5-flash",
+    caseCallsByKey: {},
+    lastModelUsed: existing?.lastModelUsed || LOCKED_FLASH_MODEL,
     lastCallAt: existing?.lastCallAt || null,
     lastError: null,
   };
@@ -108,6 +128,31 @@ export function getTenantBudgetState(tenantId = "vejle-maegleren"): TenantBudget
   return fresh;
 }
 
+export function calculateTokenCostDkk(usage?: {
+  promptTokenCount?: number;
+  candidatesTokenCount?: number;
+  thoughtsTokenCount?: number;
+  cachedContentTokenCount?: number;
+}): { costDkk: number; inputTokens: number; outputTokens: number } {
+  if (!usage) {
+    return { costDkk: 0.02, inputTokens: 0, outputTokens: 0 };
+  }
+  const promptTokens = Math.max(0, Number(usage.promptTokenCount || 0));
+  const cachedTokens = Math.max(0, Math.min(promptTokens, Number(usage.cachedContentTokenCount || 0)));
+  const uncachedInput = Math.max(0, promptTokens - cachedTokens);
+  const outputTokens =
+    Math.max(0, Number(usage.candidatesTokenCount || 0)) +
+    Math.max(0, Number(usage.thoughtsTokenCount || 0));
+
+  const costUsd =
+    (uncachedInput / 1_000_000) * FLASH_INPUT_USD_PER_1M +
+    (cachedTokens / 1_000_000) * FLASH_CACHED_USD_PER_1M +
+    (outputTokens / 1_000_000) * FLASH_OUTPUT_USD_PER_1M;
+
+  const costDkk = Math.max(0.005, Number((costUsd * USD_TO_DKK_RATE).toFixed(4)));
+  return { costDkk, inputTokens: promptTokens, outputTokens };
+}
+
 export function checkAndReserveAiBudget(options: {
   tenantId?: string;
   caseKey?: string;
@@ -115,6 +160,7 @@ export function checkAndReserveAiBudget(options: {
 }): {
   allowed: boolean;
   reason?: string;
+  reservedDkk: number;
   state: TenantBudgetState;
 } {
   const tenantId = options.tenantId || "vejle-maegleren";
@@ -124,19 +170,45 @@ export function checkAndReserveAiBudget(options: {
   const ledgers = loadAllLedgers();
   const state = getTenantBudgetState(tenantId);
 
-  // 1. Tjek hård daglig grænse på 30,00 kr.
+  // 0. Anti-Limbo in-flight check (maks 1 aktivt AI-kald pr. sag ad gangen)
+  const inflightTimestamp = activeCaseCalls.get(caseKey);
+  if (inflightTimestamp && Date.now() - inflightTimestamp < 20_000) {
+    return {
+      allowed: false,
+      reason: "Et tjek kører allerede på sagen. Vent et øjeblik.",
+      reservedDkk: 0,
+      state,
+    };
+  }
+
+  // 1. Tjek max antal kald på samme sag i dag (Anti-Limbo loop sikring)
+  const callsOnCase = Number(state.caseCallsByKey[caseKey] || 0);
+  if (callsOnCase >= MAX_ASSISTANT_CALLS_PER_CASE_SESSION) {
+    state.blockedCallsToday += 1;
+    ledgers[tenantId] = state;
+    saveAllLedgers(ledgers);
+    return {
+      allowed: false,
+      reason: `Sagen har nået loftet på ${MAX_ASSISTANT_CALLS_PER_CASE_SESSION} AI-opdateringer i dag (Zero-Limbo beskyttelse).`,
+      reservedDkk: 0,
+      state,
+    };
+  }
+
+  // 2. Tjek hård daglig grænse på 30,00 kr.
   if (state.spentDkk + cost > MAX_DAILY_AI_BUDGET_DKK) {
     state.blockedCallsToday += 1;
     ledgers[tenantId] = state;
     saveAllLedgers(ledgers);
     return {
       allowed: false,
-      reason: `Daglig AI-beløbsgrænse på ${MAX_DAILY_AI_BUDGET_DKK.toFixed(2).replace(".", ",")} kr. er nået (${state.spentDkk.toFixed(2).replace(".", ",")} kr. brugt i dag). Systemet bruger deterministisk 5-register krydsrevision (0,00 kr.).`,
+      reason: `Daglig grænse på ${MAX_DAILY_AI_BUDGET_DKK.toFixed(2).replace(".", ",")} kr. er nået.`,
+      reservedDkk: 0,
       state,
     };
   }
 
-  // 2. Tjek sagsloft (2,50 kr. pr. adresse/sag i dag)
+  // 3. Tjek sagsloft (3,00 kr. pr. adresse/sag i dag)
   const currentCaseSpend = Number(state.caseSpendByKey[caseKey] || 0);
   if (currentCaseSpend + cost > MAX_CASE_AI_BUDGET_DKK) {
     state.blockedCallsToday += 1;
@@ -144,23 +216,68 @@ export function checkAndReserveAiBudget(options: {
     saveAllLedgers(ledgers);
     return {
       allowed: false,
-      reason: `Sagsloftet på ${MAX_CASE_AI_BUDGET_DKK.toFixed(2).replace(".", ",")} kr. for denne adresse er nået i dag. Bruger deterministisk 5-register krydsrevision (0,00 kr.).`,
+      reason: `Sagsloftet på ${MAX_CASE_AI_BUDGET_DKK.toFixed(2).replace(".", ",")} kr. for denne sag er nået i dag.`,
+      reservedDkk: 0,
       state,
     };
   }
 
-  // Reservér beløbet med det samme (forhindrer race conditions / løbske kald)
+  // Sæt in-flight lås og reservér beløbet med det samme
+  activeCaseCalls.set(caseKey, Date.now());
   state.spentDkk = Number((state.spentDkk + cost).toFixed(4));
   state.totalHistoricalSpentDkk = Number((state.totalHistoricalSpentDkk + cost).toFixed(4));
   state.callsToday += 1;
   state.caseSpendByKey[caseKey] = Number((currentCaseSpend + cost).toFixed(4));
+  state.caseCallsByKey[caseKey] = callsOnCase + 1;
   state.lastCallAt = new Date().toISOString();
-  state.lastModelUsed = "gemini-2.5-flash";
+  state.lastModelUsed = LOCKED_FLASH_MODEL;
 
   ledgers[tenantId] = state;
   saveAllLedgers(ledgers);
 
-  return { allowed: true, state };
+  return { allowed: true, reservedDkk: cost, state };
+}
+
+export function finalizeAiCallUsage(options: {
+  tenantId?: string;
+  caseKey?: string;
+  reservedDkk: number;
+  usageMetadata?: {
+    promptTokenCount?: number;
+    candidatesTokenCount?: number;
+    thoughtsTokenCount?: number;
+    cachedContentTokenCount?: number;
+  };
+}): TenantBudgetState {
+  const tenantId = options.tenantId || "vejle-maegleren";
+  const caseKey = (options.caseKey || "default").toLowerCase().trim();
+  activeCaseCalls.delete(caseKey);
+
+  const ledgers = loadAllLedgers();
+  const state = getTenantBudgetState(tenantId);
+
+  if (options.usageMetadata) {
+    const { costDkk, inputTokens, outputTokens } = calculateTokenCostDkk(options.usageMetadata);
+    const delta = Number((costDkk - options.reservedDkk).toFixed(4));
+    state.spentDkk = Math.max(0, Number((state.spentDkk + delta).toFixed(4)));
+    state.totalHistoricalSpentDkk = Math.max(0, Number((state.totalHistoricalSpentDkk + delta).toFixed(4)));
+    state.caseSpendByKey[caseKey] = Math.max(
+      0,
+      Number(((state.caseSpendByKey[caseKey] || 0) + delta).toFixed(4))
+    );
+    state.inputTokensToday = (state.inputTokensToday || 0) + inputTokens;
+    state.outputTokensToday = (state.outputTokensToday || 0) + outputTokens;
+  }
+
+  ledgers[tenantId] = state;
+  saveAllLedgers(ledgers);
+  return state;
+}
+
+export function releaseInFlightLock(caseKey?: string) {
+  if (caseKey) {
+    activeCaseCalls.delete(caseKey.toLowerCase().trim());
+  }
 }
 
 export function computePayloadSha256(parts: (string | Buffer)[]): string {
@@ -178,7 +295,6 @@ export function getCachedAiAnalysis(sha256Key: string, tenantId = "vejle-maegler
       const cache = JSON.parse(fs.readFileSync(DOC_CACHE_FILE, "utf8"));
       const entry = cache?.[sha256Key];
       if (entry && typeof entry.analysis === "string") {
-        // Registrér cache-hit (0,00 kr.)
         const ledgers = loadAllLedgers();
         const state = getTenantBudgetState(tenantId);
         state.cacheHitsToday += 1;
@@ -200,7 +316,6 @@ export function setCachedAiAnalysis(sha256Key: string, analysis: string, address
     if (fs.existsSync(DOC_CACHE_FILE)) {
       cache = JSON.parse(fs.readFileSync(DOC_CACHE_FILE, "utf8")) || {};
     }
-    // Hold maks 200 seneste analyser i cachen
     const keys = Object.keys(cache);
     if (keys.length > 200) {
       delete cache[keys[0]];

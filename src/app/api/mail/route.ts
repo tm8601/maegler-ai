@@ -4,7 +4,16 @@ import { upsertSellerCase } from "@/lib/case-store";
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    const { to, sellerName, address, caseId, aiQuestions, generatedAfsnit11Clauses } = body;
+    const {
+      to,
+      sellerName,
+      address,
+      caseId,
+      agentEmail,
+      agentName,
+      aiQuestions,
+      generatedAfsnit11Clauses,
+    } = body;
 
     if (!to) {
       return NextResponse.json({ error: "Indtast venligst sælgers e-mailadresse" }, { status: 400 });
@@ -12,7 +21,9 @@ export async function POST(request: Request) {
 
     const savedCase = upsertSellerCase({
       id: caseId,
-      address: address || "Kløvertoften 38, 7100 Vejle",
+      agentEmail,
+      agentName,
+      address: address || "H C Hansens Vej 29, 7100 Vejle",
       sellerName: sellerName || "Sælger",
       sellerEmail: to,
       status: "sendt",
@@ -62,6 +73,7 @@ export async function POST(request: Request) {
         messageId: data?.id || "resend-msg",
         sellerPortalUrl,
         caseId: savedCase.id,
+        sellerCase: savedCase,
       });
     }
 
@@ -71,6 +83,7 @@ export async function POST(request: Request) {
       simulated: true,
       sellerPortalUrl,
       caseId: savedCase.id,
+      sellerCase: savedCase,
     });
   } catch (error: any) {
     console.error("Mail sending error:", error);
