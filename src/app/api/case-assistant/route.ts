@@ -89,7 +89,7 @@ export async function POST(request: Request) {
     const resolvedFlags = new Set(currentCase.resolvedFlagIds || []);
     const clauses = [...(currentCase.generatedAfsnit11Clauses || [])];
     const actionsTaken: string[] = [];
-    const fileParts: Array<{ inlineData: { data: string; mimeType: string } }> = [];
+    const fileParts: Array<{ inlineData: { data: string; mimeType: string } } | { text: string }> = [];
     const uploadedNames: string[] = [];
 
     for (const file of files) {
@@ -103,7 +103,12 @@ export async function POST(request: Request) {
       }
       const existingMeta = nextDocMetas.find((d) => d.name === file.name);
       const docId = existingMeta?.id || `doc-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-      const isImage = file.type.startsWith("image/") || /\.(png|jpg|jpeg|webp)$/i.test(file.name);
+      const isPdfMagic = buffer.length >= 5 && buffer.subarray(0, 5).toString("ascii") === "%PDF-";
+      const isPngMagic =
+        buffer.length >= 8 && buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47;
+      const isJpgMagic = buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+      const isImage =
+        isPngMagic || isJpgMagic || file.type.startsWith("image/") || /\.(png|jpg|jpeg|webp)$/i.test(file.name);
       saveUploadedFileToDisk(
         resolvedId,
         docId,
@@ -122,12 +127,15 @@ export async function POST(request: Request) {
           matchedReminderId: matchedRem,
         });
       }
-      fileParts.push({
-        inlineData: {
-          data: buffer.toString("base64"),
-          mimeType: file.type || "application/pdf",
-        },
-      });
+      if (isPdfMagic) {
+        fileParts.push({ inlineData: { data: buffer.toString("base64"), mimeType: "application/pdf" } });
+      } else if (isPngMagic) {
+        fileParts.push({ inlineData: { data: buffer.toString("base64"), mimeType: "image/png" } });
+      } else if (isJpgMagic) {
+        fileParts.push({ inlineData: { data: buffer.toString("base64"), mimeType: "image/jpeg" } });
+      } else {
+        fileParts.push({ text: `--- BILAG: ${file.name} ---\n${buffer.toString("utf8").slice(0, 40000)}` });
+      }
     }
 
     // Deterministisk forhåndstolkning af mæglerens instruks (sikrer at opdateringer altid slår igennem, også ved fallback)

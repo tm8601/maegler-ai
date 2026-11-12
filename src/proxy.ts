@@ -23,7 +23,8 @@ function isAllowedOrigin(origin: string | null): boolean {
       host === "127.0.0.1" ||
       host === "ai-beregner.dk" ||
       host.endsWith(".ai-beregner.dk") ||
-      /^192\.168\.\d{1,3}\.\d{1,3}$/.test(host)
+      /^192\.168\.\d{1,3}\.\d{1,3}$/.test(host) ||
+      /^100\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)
     ) {
       return true;
     }

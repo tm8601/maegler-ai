@@ -75,6 +75,50 @@ Returnér ALTID gyldig JSON med præcis denne struktur:
 }
 `;
 
+function detectBinaryMimeType(buffer: Buffer): string | null {
+  if (buffer.length >= 5 && buffer.subarray(0, 5).toString("ascii") === "%PDF-") {
+    return "application/pdf";
+  }
+  if (
+    buffer.length >= 8 &&
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47
+  ) {
+    return "image/png";
+  }
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    return "image/jpeg";
+  }
+  if (
+    buffer.length >= 12 &&
+    buffer.subarray(0, 4).toString("ascii") === "RIFF" &&
+    buffer.subarray(8, 12).toString("ascii") === "WEBP"
+  ) {
+    return "image/webp";
+  }
+  return null;
+}
+
+function buildGeminiPartForBuffer(
+  fileName: string,
+  buffer: Buffer
+): { inlineData: { data: string; mimeType: string } } | { text: string } {
+  const binaryMime = detectBinaryMimeType(buffer);
+  if (binaryMime) {
+    return {
+      inlineData: {
+        data: buffer.toString("base64"),
+        mimeType: binaryMime,
+      },
+    };
+  }
+  return {
+    text: `--- DOKUMENT: ${fileName} ---\n${buffer.toString("utf8").slice(0, 45000)}`,
+  };
+}
+
 function parseDocumentTextForTingbog(rawText: string) {
   const lower = rawText.toLowerCase();
   const fundetTingbog =
@@ -293,7 +337,7 @@ export async function POST(request: Request) {
     const shaParts: (string | Buffer)[] = [Buffer.from(profile.adresse, "utf8")];
     let combinedRawText = "";
     const rawTextsByFile: Record<string, string> = {};
-    const fileParts: Array<{ inlineData: { data: string; mimeType: string } }> = [];
+    const fileParts: Array<{ inlineData: { data: string; mimeType: string } } | { text: string }> = [];
     const nowTime = new Date().toLocaleTimeString("da-DK", { hour: "2-digit", minute: "2-digit" });
     const newDocMetas = [...(existingCase.uploadedDocMeta || [])];
     const resolvedReminders = new Set(existingCase.resolvedReminderIds || []);
@@ -304,16 +348,22 @@ export async function POST(request: Request) {
       const buffer = Buffer.from(arrayBuffer);
       shaParts.push(buffer);
 
-      const fileText = buffer.toString("utf8").slice(0, 50000);
+      const binaryMime = detectBinaryMimeType(buffer);
+      const fileText = binaryMime ? "" : buffer.toString("utf8").slice(0, 50000);
       rawTextsByFile[file.name] = fileText;
-      combinedRawText += `\n--- FIL: ${file.name} ---\n` + fileText;
+      if (fileText) {
+        combinedRawText += `\n--- FIL: ${file.name} ---\n` + fileText;
+      }
 
       const matchedRem = detectReminderMatchFromFilename(file.name);
       if (matchedRem) {
         resolvedReminders.add(matchedRem);
       }
 
-      const isImage = file.type.startsWith("image/") || /\.(png|jpg|jpeg|webp)$/i.test(file.name);
+      const isImage =
+        (binaryMime && binaryMime.startsWith("image/")) ||
+        file.type.startsWith("image/") ||
+        /\.(png|jpg|jpeg|webp)$/i.test(file.name);
       const existingMeta = newDocMetas.find((m) => m.name === file.name);
       const docId = existingMeta?.id || `doc-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 
@@ -321,7 +371,7 @@ export async function POST(request: Request) {
         resolvedCaseId,
         docId,
         file.name,
-        file.type || (isImage ? "image/png" : "application/pdf"),
+        binaryMime || file.type || (isImage ? "image/png" : "application/pdf"),
         buffer
       );
 
@@ -331,18 +381,13 @@ export async function POST(request: Request) {
           name: file.name,
           sizeKb: Math.max(1, Math.round(file.size / 1024)),
           type: isImage ? "photo" : "document",
-          mimeType: file.type || (isImage ? "image/png" : "application/pdf"),
+          mimeType: binaryMime || file.type || (isImage ? "image/png" : "application/pdf"),
           uploadedAt: nowTime,
           matchedReminderId: matchedRem,
         });
       }
 
-      fileParts.push({
-        inlineData: {
-          data: buffer.toString("base64"),
-          mimeType: file.type || (isImage ? "image/png" : "application/pdf"),
-        },
-      });
+      fileParts.push(buildGeminiPartForBuffer(file.name, buffer));
     }
 
     // Hvis brugeren klikkede "Genkør AI-kontrol" uden at vedhæfte nye filer i dette kald, hent gemte filer fra disk
@@ -351,15 +396,13 @@ export async function POST(request: Request) {
       for (const df of diskFiles) {
         fileNames.push(df.fileName);
         shaParts.push(df.buffer);
-        const fileText = df.buffer.toString("utf8").slice(0, 40000);
+        const binaryMime = detectBinaryMimeType(df.buffer);
+        const fileText = binaryMime ? "" : df.buffer.toString("utf8").slice(0, 40000);
         rawTextsByFile[df.fileName] = fileText;
-        combinedRawText += `\n--- FIL: ${df.fileName} ---\n` + fileText;
-        fileParts.push({
-          inlineData: {
-            data: df.buffer.toString("base64"),
-            mimeType: df.mimeType,
-          },
-        });
+        if (fileText) {
+          combinedRawText += `\n--- FIL: ${df.fileName} ---\n` + fileText;
+        }
+        fileParts.push(buildGeminiPartForBuffer(df.fileName, df.buffer));
       }
     }
 
@@ -514,9 +557,9 @@ Analysér hver enkelt fil/foto/plantegning op imod BBR, Byggesag og Tingbog, og 
         config: {
           systemInstruction: BOLIGHANDEL_ANALYSIS_SYSTEM_PROMPT,
           temperature: 0.0,
-          maxOutputTokens: 2048,
+          maxOutputTokens: 4096,
           responseMimeType: "application/json",
-          thinkingConfig: { thinkingBudget: 512 },
+          thinkingConfig: { thinkingBudget: 256 },
         },
       })
       .catch((err) => {
@@ -535,7 +578,11 @@ Analysér hver enkelt fil/foto/plantegning op imod BBR, Byggesag og Tingbog, og 
     let aiSummaryMarkdown = "";
     if (aiResponse && aiResponse.text) {
       try {
-        const parsedJson = JSON.parse(aiResponse.text);
+        const cleanJsonText = aiResponse.text
+          .replace(/^```(?:json)?\s*/i, "")
+          .replace(/\s*```$/i, "")
+          .trim();
+        const parsedJson = JSON.parse(cleanJsonText);
         if (
           parsedJson.floorplanDetected &&
           parsedJson.floorplanDetected.isFloorplan &&
@@ -606,7 +653,9 @@ Analysér hver enkelt fil/foto/plantegning op imod BBR, Byggesag og Tingbog, og 
           aiSummaryMarkdown = parsedJson.markdownSummary;
         }
       } catch {
-        aiSummaryMarkdown = aiResponse.text;
+        if (!aiResponse.text.trim().startsWith("{")) {
+          aiSummaryMarkdown = aiResponse.text;
+        }
       }
     }
 
