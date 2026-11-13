@@ -470,20 +470,30 @@ export function verifyAgentToken(token?: string | null): AgentUser | null {
   }
 }
 
+const globalForCases = globalThis as unknown as {
+  __maeglerCasesMemoryStore?: Record<string, SellerCaseRecord>;
+};
+
 function loadCases(): Record<string, SellerCaseRecord> {
   ensureDataDir();
+  const mem = globalForCases.__maeglerCasesMemoryStore || {};
   try {
     if (fs.existsSync(CASES_FILE)) {
       const raw = JSON.parse(fs.readFileSync(CASES_FILE, "utf8"));
-      if (raw && typeof raw === "object") return raw;
+      if (raw && typeof raw === "object") {
+        const merged = { ...raw, ...mem };
+        globalForCases.__maeglerCasesMemoryStore = merged;
+        return merged;
+      }
     }
   } catch {
     // Ignore
   }
-  return {};
+  return { ...mem };
 }
 
 function saveCases(cases: Record<string, SellerCaseRecord>) {
+  globalForCases.__maeglerCasesMemoryStore = { ...cases };
   ensureDataDir();
   try {
     fs.writeFileSync(CASES_FILE, JSON.stringify(cases, null, 2), "utf8");

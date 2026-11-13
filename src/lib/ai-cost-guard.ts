@@ -3,13 +3,25 @@ import path from "path";
 import crypto from "crypto";
 
 export function resolvePersistentDataDir(): string {
-  if (process.env.DATA_DIR) return process.env.DATA_DIR;
-  try {
-    if (fs.existsSync("/data")) {
-      return "/data/maegler-ai-data";
+  const candidates = [
+    process.env.DATA_DIR,
+    "/data/maegler-ai-data",
+    "/app/data/maegler-ai-data",
+    "/tmp/maegler-ai-data",
+  ].filter(Boolean) as string[];
+
+  for (const dir of candidates) {
+    try {
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      const testFile = path.join(dir, ".write-test");
+      fs.writeFileSync(testFile, "ok", "utf8");
+      fs.unlinkSync(testFile);
+      return dir;
+    } catch {
+      // Prøv næste skrivbare mappe
     }
-  } catch {
-    // Ignore
   }
   return "/tmp/maegler-ai-data";
 }
