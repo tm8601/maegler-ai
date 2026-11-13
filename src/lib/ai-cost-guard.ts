@@ -2,13 +2,25 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 
-const DATA_DIR = process.env.DATA_DIR || "/tmp/maegler-ai-data";
+export function resolvePersistentDataDir(): string {
+  if (process.env.DATA_DIR) return process.env.DATA_DIR;
+  try {
+    if (fs.existsSync("/data")) {
+      return "/data/maegler-ai-data";
+    }
+  } catch {
+    // Ignore
+  }
+  return "/tmp/maegler-ai-data";
+}
+
+const DATA_DIR = resolvePersistentDataDir();
 const LEDGER_FILE = path.join(DATA_DIR, "ai-budget-ledger.json");
 const DOC_CACHE_FILE = path.join(DATA_DIR, "ai-doc-cache.json");
 
-// Hård daglig grænse på 30,00 kr. og sagsloft på 3,00 kr. (Zero-Limbo)
+// Hård daglig grænse på 30,00 kr. og sagsloft på 5,00 kr. (Zero-Limbo)
 export const MAX_DAILY_AI_BUDGET_DKK = Number(process.env.MAX_DAILY_AI_BUDGET_DKK || 30.0);
-export const MAX_CASE_AI_BUDGET_DKK = Number(process.env.MAX_CASE_AI_BUDGET_DKK || 3.0);
+export const MAX_CASE_AI_BUDGET_DKK = Number(process.env.MAX_CASE_AI_BUDGET_DKK || 5.0);
 export const ALLOW_PRO_MODELS = process.env.ALLOW_PRO_MODELS === "true";
 export const LOCKED_FLASH_MODEL = "gemini-2.5-flash";
 export const USD_TO_DKK_RATE = 7.0;
@@ -24,7 +36,7 @@ export const COST_PER_ASSISTANT_TURN_DKK = 0.03;
 
 // In-memory concurrency guard for at forhindre enhver form for "limbo" eller parallelle loops
 const activeCaseCalls = new Map<string, number>();
-const MAX_ASSISTANT_CALLS_PER_CASE_SESSION = 15;
+const MAX_ASSISTANT_CALLS_PER_CASE_SESSION = 35;
 
 export interface TenantBudgetState {
   tenantId: string;
@@ -172,7 +184,7 @@ export function checkAndReserveAiBudget(options: {
 
   // 0. Anti-Limbo in-flight check (maks 1 aktivt AI-kald pr. sag ad gangen)
   const inflightTimestamp = activeCaseCalls.get(caseKey);
-  if (inflightTimestamp && Date.now() - inflightTimestamp < 20_000) {
+  if (inflightTimestamp && Date.now() - inflightTimestamp < 8_000) {
     return {
       allowed: false,
       reason: "Et tjek kører allerede på sagen. Vent et øjeblik.",

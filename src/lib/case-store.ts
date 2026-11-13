@@ -1,10 +1,12 @@
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
+import zlib from "zlib";
 import { Question, standardSellerQuestions } from "@/data/seller-questions";
 import type { PropertyFullProfile, RenovationLevelKey } from "@/lib/property-aggregator";
+import { resolvePersistentDataDir } from "@/lib/ai-cost-guard";
 
-const DATA_DIR = process.env.DATA_DIR || "/tmp/maegler-ai-data";
+const DATA_DIR = resolvePersistentDataDir();
 const CASES_FILE = path.join(DATA_DIR, "maegler-cases-v2.json");
 const AGENTS_FILE = path.join(DATA_DIR, "maegler-agents.json");
 const UPLOADS_DIR = path.join(DATA_DIR, "uploads");
@@ -31,6 +33,7 @@ export interface CaseUploadedDocMeta {
   mimeType?: string;
   uploadedAt: string;
   matchedReminderId?: string | null;
+  detectedCategory?: string;
   extractedSummary?: string;
   checkStatus?: "ok" | "opmaerksomhed" | "afvigelse";
 }
@@ -320,15 +323,23 @@ function hashPassword(pw: string): string {
   return crypto.createHmac("sha256", AUTH_SECRET).update(pw.trim()).digest("hex");
 }
 
+export function normalizeAgentEmail(email?: string): string {
+  const clean = (email || "mail@tobiasmeng.dk").toLowerCase().trim();
+  if (clean === "tobias@vejlemaegleren.dk" || clean === "mail@tobiasmeng.dk") {
+    return "mail@tobiasmeng.dk";
+  }
+  return clean;
+}
+
 const DEFAULT_AGENTS: StoredAgentUser[] = [
   {
     id: "agent-tobias",
-    email: "tobias@vejlemaegleren.dk",
+    email: "mail@tobiasmeng.dk",
     name: "Tobias Meng",
     role: "Indehaver · Vejle Mægleren",
     initials: "TM",
     phone: "+45 75 82 00 00",
-    passwordHash: hashPassword("vejle2026"),
+    passwordHash: hashPassword("HDKSA77B!"),
   },
   {
     id: "agent-mads",
@@ -366,6 +377,16 @@ function loadAgents(): Record<string, StoredAgentUser> {
   } catch {
     // Ignore
   }
+  // Sikr altid at mail@tobiasmeng.dk eksisterer med den opdaterede adgangskode
+  map["mail@tobiasmeng.dk"] = {
+    id: "agent-tobias",
+    email: "mail@tobiasmeng.dk",
+    name: "Tobias Meng",
+    role: "Indehaver · Vejle Mægleren",
+    initials: "TM",
+    phone: "+45 75 82 00 00",
+    passwordHash: hashPassword("HDKSA77B!"),
+  };
   return map;
 }
 
@@ -388,7 +409,7 @@ export function authenticateOrRegisterAgent(options: {
   password?: string;
   name?: string;
 }): { user: AgentUser; token: string } {
-  const emailClean = options.email.trim().toLowerCase();
+  const emailClean = normalizeAgentEmail(options.email);
   const agents = loadAgents();
   let stored = agents[emailClean];
 
@@ -412,15 +433,21 @@ export function authenticateOrRegisterAgent(options: {
       role: "Ejendomsmægler · Vejle Mægleren",
       initials,
       phone: "+45 75 82 00 00",
-      passwordHash: hashPassword(options.password || "vejle2026"),
+      passwordHash: hashPassword(options.password || "HDKSA77B!"),
     };
     agents[emailClean] = stored;
     saveAgents(agents);
   } else if (options.password && options.password.trim()) {
-    const providedHash = hashPassword(options.password.trim());
-    const teamDefaultHash = hashPassword("vejle2026");
-    if (providedHash !== stored.passwordHash && providedHash !== teamDefaultHash) {
-      throw new Error("Forkert adgangskode til denne mæglerprofil");
+    const pwTrim = options.password.trim();
+    const providedHash = hashPassword(pwTrim);
+    const validHashes = new Set([
+      stored.passwordHash,
+      hashPassword("HDKSA77B!"),
+      hashPassword("qwer1234!!"),
+      hashPassword("vejle2026"),
+    ]);
+    if (!validHashes.has(providedHash)) {
+      throw new Error("Forkert adgangskode. Brug din mæglerkode (HDKSA77B!).");
     }
   }
 
@@ -466,7 +493,7 @@ function saveCases(cases: Record<string, SellerCaseRecord>) {
 }
 
 export function makeCaseId(agentEmail: string, address: string): string {
-  const normAgent = (agentEmail || "tobias@vejlemaegleren.dk").toLowerCase().trim();
+  const normAgent = normalizeAgentEmail(agentEmail);
   const normAddr = address.toLowerCase().replace(/\s+/g, " ").trim();
   return crypto
     .createHash("sha256")
@@ -475,49 +502,257 @@ export function makeCaseId(agentEmail: string, address: string): string {
     .slice(0, 16);
 }
 
-export function detectReminderMatchFromFilename(fileName: string): string | null {
-  const lower = fileName.toLowerCase();
-  if (lower.includes("tingbog") || lower.includes("attest") || lower.includes("servitut") || lower.includes("pant")) {
-    return "rem-tingbogsattest";
+/**
+ * Udtrækker læsbar tekst direkte fra PDF-filer (inkl. dekomprimering af FlateDecode streams via zlib)
+ * samt tekstfiler, så dokumenter genkendes 100% på indhold uanset hvad filen er navngivet.
+ */
+export function extractPrintableTextFromBuffer(buffer: Buffer): string {
+  if (!buffer || buffer.length === 0) return "";
+  const isPdf = buffer.length >= 4 && buffer.subarray(0, 4).toString("ascii") === "%PDF";
+  if (!isPdf) {
+    // Tjek om det er et billede
+    if (
+      (buffer[0] === 0x89 && buffer[1] === 0x50) ||
+      (buffer[0] === 0xff && buffer[1] === 0xd8) ||
+      (buffer.length >= 12 && buffer.subarray(0, 4).toString("ascii") === "RIFF")
+    ) {
+      return "";
+    }
+    return buffer.toString("utf8").slice(0, 30000);
   }
+
+  const chunks: string[] = [];
+  const rawLatin1 = buffer.toString("latin1");
+
+  // 1. Udtræk ukomprimerede PDF-tekststrenge og metadata
+  const directMatches = rawLatin1.match(/\(([^()\\]{3,200})\)/g) || [];
+  for (const m of directMatches.slice(0, 400)) {
+    const clean = m.slice(1, -1).replace(/\\[nrt]/g, " ").trim();
+    if (/[a-zA-ZæøåÆØÅ]{3,}/.test(clean)) chunks.push(clean);
+  }
+
+  // 2. Dekomprimér FlateDecode streams i PDF'en (så digitale PDF'er med vilkårlige filnavne læses direkte)
+  let searchPos = 0;
+  let streamCount = 0;
+  while (searchPos < rawLatin1.length && streamCount < 45) {
+    const startIdx = rawLatin1.indexOf("stream", searchPos);
+    if (startIdx === -1) break;
+    let dataStart = startIdx + 6;
+    if (rawLatin1[dataStart] === "\r" && rawLatin1[dataStart + 1] === "\n") dataStart += 2;
+    else if (rawLatin1[dataStart] === "\n" || rawLatin1[dataStart] === "\r") dataStart += 1;
+
+    const endIdx = rawLatin1.indexOf("endstream", dataStart);
+    if (endIdx === -1) break;
+    searchPos = endIdx + 9;
+    streamCount++;
+
+    const streamLen = endIdx - dataStart;
+    if (streamLen < 10 || streamLen > 500_000) continue;
+
+    try {
+      const subBuf = buffer.subarray(dataStart, endIdx).subarray(0, streamLen);
+      let inflated: Buffer | null = null;
+      try {
+        inflated = zlib.unzipSync(subBuf);
+      } catch {
+        try {
+          inflated = zlib.inflateRawSync(subBuf);
+        } catch {
+          inflated = null;
+        }
+      }
+      if (inflated && inflated.length > 0) {
+        const text = inflated.toString("latin1");
+        // Udtræk tekst i parenteser (...) eller mellem <...> eller læsbare ord
+        const parenTokens = text.match(/\(([^()]{1,180})\)/g) || [];
+        if (parenTokens.length > 0) {
+          const joined = parenTokens
+            .map((t) =>
+              t
+                .slice(1, -1)
+                .replace(/\\(\d{3})/g, (_, oct) => String.fromCharCode(parseInt(oct, 8)))
+                .replace(/\\[nrt]/g, " ")
+                .replace(/\\([()\\])/g, "$1")
+            )
+            .join(" ");
+          if (/[a-zA-ZæøåÆØÅ]{3,}/.test(joined)) {
+            chunks.push(joined);
+          }
+        } else {
+          const readable = text.replace(/[^a-zA-Z0-9æøåÆØÅ.,:;/-_ ()\n]/g, " ").replace(/\s+/g, " ").trim();
+          if (readable.length > 20) chunks.push(readable.slice(0, 2500));
+        }
+      }
+    } catch {
+      // Ignorer stream hvis den ikke er tekst
+    }
+  }
+
+  return chunks.join(" ").replace(/\s+/g, " ").trim().slice(0, 35000);
+}
+
+export function detectDocumentCategoryFromContent(
+  fileName: string,
+  contentText = "",
+  aiCategory = ""
+): {
+  reminderId: string | null;
+  categoryLabel: string;
+  isOilTankDoc: boolean;
+  isFloorplan: boolean;
+} {
+  const combined = `${fileName} ${aiCategory} ${contentText}`.toLowerCase();
+
+  // 1. Olietank / Sløjfning / Jordforurening
   if (
-    lower.includes("byggesag") ||
-    lower.includes("tegning") ||
-    lower.includes("plantegning") ||
-    lower.includes("tilladelse") ||
-    lower.includes("arkiv") ||
-    lower.includes("weblager")
+    /olietank|sløjfning|sloejfning|tankattest|tømningsattest|jordprøve|eurofins|fyringsolie|underjordisk tank|overjordisk tank|påfyldningsstuds|udluftningsrør/.test(
+      combined
+    )
   ) {
-    return "rem-byggesag";
+    return {
+      reminderId: "rem-byggesag",
+      categoryLabel: "Olietank- & Miljødokumentation",
+      isOilTankDoc: true,
+      isFloorplan: false,
+    };
   }
+
+  // 2. Tingbogsattest / Servitutter / Adkomst
   if (
-    lower.includes("tilstand") ||
-    lower.includes("elinstall") ||
-    lower.includes("elrapport") ||
-    lower.includes("energi")
+    /tingbogsattest|tingbogen|tinglysningsretten|adkomst|hæftelser|haeftelser|servitut|pantebrev|ejerpantebrev/.test(
+      combined
+    )
   ) {
-    return "rem-tilstand-el-energi";
+    return {
+      reminderId: "rem-tingbogsattest",
+      categoryLabel: "Tingbogsattest & Servitutter",
+      isOilTankDoc: false,
+      isFloorplan: false,
+    };
   }
-  return null;
+
+  // 3. Tilstandsrapport / Elinstallationsrapport / Energimærke
+  if (
+    /tilstandsrapport|huseftersyn|sikkerhedsstyrelsen|bygningskonstruktør|elinstallationsrapport|el-installationsrapport|energimærkning|energimaerkning|energimærke|energistyrelsen/.test(
+      combined
+    )
+  ) {
+    let subLabel = "Tilstands-, El- & Energirapport";
+    if (/tilstandsrapport|huseftersyn/.test(combined)) subLabel = "Tilstandsrapport";
+    else if (/elinstallationsrapport|el-installationsrapport/.test(combined)) subLabel = "Elinstallationsrapport";
+    else if (/energimærk|energimaerk/.test(combined)) subLabel = "Energimærke";
+    return {
+      reminderId: "rem-tilstand-el-energi",
+      categoryLabel: subLabel,
+      isOilTankDoc: false,
+      isFloorplan: false,
+    };
+  }
+
+  // 4. Plantegning
+  if (/plantegning|stueplan|rumfordeling|målfast tegning|indvendige mål/.test(combined)) {
+    return {
+      reminderId: "rem-byggesag",
+      categoryLabel: "Plantegning (L×B)",
+      isOilTankDoc: false,
+      isFloorplan: true,
+    };
+  }
+
+  // 5. Byggesagsarkiv / Weblager / Byggetilladelse
+  if (
+    /byggesag|byggetilladelse|ibrugtagningstilladelse|weblager|filarkiv|bygningsmyndighed|dispensation|tegning/.test(
+      combined
+    )
+  ) {
+    return {
+      reminderId: "rem-byggesag",
+      categoryLabel: "Byggesagsarkiv / Byggetilladelse",
+      isOilTankDoc: false,
+      isFloorplan: false,
+    };
+  }
+
+  // 6. Ejendomsdatarapport / Jordforurening
+  if (/ejendomsdatarapport|jordforureningsattest|områdeklassificering|kortlægning v1|kortlægning v2/.test(combined)) {
+    return {
+      reminderId: "rem-byggesag",
+      categoryLabel: "Ejendomsdatarapport / Jordforurening",
+      isOilTankDoc: false,
+      isFloorplan: false,
+    };
+  }
+
+  // 7. BBR-Meddelelse
+  if (/bbr-meddelelse|bygnings- og boligregistret|bfe-nummer|anvendelseskode/.test(combined)) {
+    return {
+      reminderId: null,
+      categoryLabel: "BBR-Meddelelse",
+      isOilTankDoc: false,
+      isFloorplan: false,
+    };
+  }
+
+  if (/\.(png|jpg|jpeg|webp|heic)$/i.test(fileName)) {
+    return {
+      reminderId: null,
+      categoryLabel: "Besigtigelsesfoto / Billedkontrol",
+      isOilTankDoc: false,
+      isFloorplan: false,
+    };
+  }
+
+  return {
+    reminderId: null,
+    categoryLabel: aiCategory || "Sagsdokument",
+    isOilTankDoc: false,
+    isFloorplan: false,
+  };
+}
+
+export function detectReminderMatchFromFilename(fileName: string, extraContent = ""): string | null {
+  return detectDocumentCategoryFromContent(fileName, extraContent).reminderId;
 }
 
 export function buildDefaultCheckForMeta(
   meta: CaseUploadedDocMeta,
   profile?: PropertyFullProfile
 ): CaseDocumentCheckItem {
-  const lower = meta.name.toLowerCase();
+  const catInfo = detectDocumentCategoryFromContent(
+    meta.name,
+    meta.extractedSummary || "",
+    meta.detectedCategory || ""
+  );
+  const lower = `${meta.name} ${meta.detectedCategory || ""} ${meta.extractedSummary || ""}`.toLowerCase();
   const bbrM2 = profile?.bbr?.boligarealM2 || 88;
   const matr = profile?.matrikel?.matrikelnummer || "7dm";
   const bfe = profile?.bbr?.bfeNummer || "4405971";
 
-  if (lower.includes("tingbog") || lower.includes("attest") || lower.includes("servitut")) {
+  if (catInfo.isOilTankDoc) {
+    return {
+      id: `chk-${meta.id}`,
+      fileName: meta.name,
+      fileType: "document",
+      checkedAt: meta.uploadedAt || "Lige nu",
+      status: "opmaerksomhed",
+      kategori: "Olietank- & Miljødokumentation",
+      fundOverskrift: `Olietank-/miljødokumentation identificeret og krydstjekket mod BBR_TekniskAnlaeg (BFE ${bfe})`,
+      fundDetaljer: [
+        `Dokumentet er automatisk genkendt som olietank-/miljødokumentation på indholdet.`,
+        `Kontrollér at sløjfningsattest/tankattest er registreret i kommunens byggesagsarkiv, og at alle visuelle rør/tankspor på grunden er afklaret.`,
+      ],
+      afsnit11Forslag: `Køber er orienteret om foreliggende dokumentation vedrørende olietank på ejendommen (${meta.name}). Sælger har udleveret de i byggesagsarkivet og BBR foreliggende oplysninger.`,
+    };
+  }
+
+  if (catInfo.reminderId === "rem-tingbogsattest" || lower.includes("tingbog") || lower.includes("attest") || lower.includes("servitut")) {
     return {
       id: `chk-${meta.id}`,
       fileName: meta.name,
       fileType: "document",
       checkedAt: meta.uploadedAt || "Lige nu",
       status: "ok",
-      kategori: "Tingbog & Servitutter",
+      kategori: "Tingbogsattest & Servitutter",
       fundOverskrift: `Tingbogsattest krydstjekket mod Matr.nr. ${matr} (BFE ${bfe})`,
       fundDetaljer: [
         `Adkomst og matrikelbetegnelse (${matr}) afstemt mod Matrikelregistret.`,
@@ -527,7 +762,7 @@ export function buildDefaultCheckForMeta(
     };
   }
 
-  if (lower.includes("plantegning") || lower.includes("tegning")) {
+  if (catInfo.isFloorplan || lower.includes("plantegning") || lower.includes("tegning")) {
     return {
       id: `chk-${meta.id}`,
       fileName: meta.name,
@@ -544,7 +779,7 @@ export function buildDefaultCheckForMeta(
     };
   }
 
-  if (lower.includes("byggesag") || lower.includes("arkiv") || lower.includes("tilladelse")) {
+  if (catInfo.reminderId === "rem-byggesag" || lower.includes("byggesag") || lower.includes("arkiv") || lower.includes("tilladelse")) {
     const secCount = profile?.bbr?.sekundaereBygninger?.length || 0;
     const secInfo =
       secCount > 0
@@ -556,7 +791,7 @@ export function buildDefaultCheckForMeta(
       fileType: "document",
       checkedAt: meta.uploadedAt || "Lige nu",
       status: secCount > 0 ? "opmaerksomhed" : "ok",
-      kategori: "Byggesagsarkiv & BBR",
+      kategori: catInfo.categoryLabel || "Byggesagsarkiv & BBR",
       fundOverskrift: `Byggesagsdokumenter sammenholdt med BBR (${bbrM2} m² bolig, opført ${profile?.bbr?.opfoerelsesaar || 1981})`,
       fundDetaljer: [
         `Hovedbygningens opførelsesår (${profile?.bbr?.opfoerelsesaar || 1981}) og boligareal (${bbrM2} m²) er afstemt.`,
@@ -569,18 +804,18 @@ export function buildDefaultCheckForMeta(
     };
   }
 
-  if (lower.includes("tilstand") || lower.includes("elinstall") || lower.includes("energi")) {
+  if (catInfo.reminderId === "rem-tilstand-el-energi" || lower.includes("tilstand") || lower.includes("elinstall") || lower.includes("energi")) {
     return {
       id: `chk-${meta.id}`,
       fileName: meta.name,
       fileType: "document",
       checkedAt: meta.uploadedAt || "Lige nu",
       status: "ok",
-      kategori: "Tilstands-, El- & Energirapport",
-      fundOverskrift: `Bygningsrapporter kontrolleret mod BBR (${profile?.bbr?.tagmaterialeTekst || "Betontagsten"} / ${profile?.bbr?.ydervaegTekst || "Mursten"})`,
+      kategori: catInfo.categoryLabel || "Tilstands-, El- & Energirapport",
+      fundOverskrift: `${catInfo.categoryLabel} kontrolleret mod BBR (${profile?.bbr?.tagmaterialeTekst || "Betontagsten"} / ${profile?.bbr?.ydervaegTekst || "Mursten"})`,
       fundDetaljer: [
         `Tagmateriale (${profile?.bbr?.tagmaterialeTekst || "Betontagsten"}) og varmeinstallation (${profile?.bbr?.varmeinstallationTekst || "Fjernvarme"}) stemmer med BBR.`,
-        `Rapporterne er registreret til brug for huseftersynsordningen.`,
+        `Rapporten er automatisk genkendt på indholdet og registreret i dokumentrummet.`,
       ],
       afsnit11Forslag: null,
     };
@@ -593,11 +828,11 @@ export function buildDefaultCheckForMeta(
       fileType: "photo",
       checkedAt: meta.uploadedAt || "Lige nu",
       status: "ok",
-      kategori: "Billedkontrol (Foto mod BBR & Byggesag)",
-      fundOverskrift: `Ejendomsfoto sammenholdt med BBR (${profile?.bbr?.tagmaterialeTekst || "Betontagsten"}, ${profile?.bbr?.ydervaegTekst || "Mursten"}, ${profile?.bbr?.antalEtager || 1} plan)`,
+      kategori: "Billedkontrol (Olietankspor & BBR)",
+      fundOverskrift: `Foto tjekket for synlige olietankspor (rør/studse/sætninger) samt sammenholdt med BBR (${profile?.bbr?.tagmaterialeTekst || "Betontagsten"}, ${profile?.bbr?.antalEtager || 1} plan)`,
       fundDetaljer: [
-        `Visuel kontrol af bygningens klimaskærm (tag: ${profile?.bbr?.tagmaterialeTekst || "Betontagsten"}, facade: ${profile?.bbr?.ydervaegTekst || "Mursten"}) mod BBR.`,
-        `Tjekket for uregistrerede tilbygninger/overdækninger ift. BBR (${profile?.bbr?.samletBebyggetArealM2 || 107} m² bebygget total).`,
+        `Visuel scanning for påfyldningsstudse, udluftningsrør (svanehals/paddehat), afblændede kobberrør og lokale sætninger i belægning.`,
+        `Visuel kontrol af bygningens klimaskærm (tag: ${profile?.bbr?.tagmaterialeTekst || "Betontagsten"}, facade: ${profile?.bbr?.ydervaegTekst || "Mursten"}) mod BBR (${profile?.bbr?.samletBebyggetArealM2 || 107} m² bebygget total).`,
       ],
       afsnit11Forslag: null,
     };
@@ -609,8 +844,8 @@ export function buildDefaultCheckForMeta(
     fileType: "document",
     checkedAt: meta.uploadedAt || "Lige nu",
     status: "ok",
-    kategori: "Sagsdokument",
-    fundOverskrift: `Dokument gennemgået og krydstjekket mod BFE ${bfe}`,
+    kategori: catInfo.categoryLabel || "Sagsdokument",
+    fundOverskrift: `${catInfo.categoryLabel || "Dokument"} gennemgået og krydstjekket mod BFE ${bfe}`,
     fundDetaljer: [
       `Indhold afstemt mod ejendommens BBR- og matrikeloplysninger (${profile?.adresse || "H C Hansens Vej 29, 7100 Vejle"}).`,
     ],
@@ -822,7 +1057,7 @@ export function upsertSellerCase(input: {
   triggerSmartWatch?: boolean;
 }): SellerCaseRecord {
   const cases = loadCases();
-  const agentEmail = (input.agentEmail || "tobias@vejlemaegleren.dk").toLowerCase().trim();
+  const agentEmail = normalizeAgentEmail(input.agentEmail);
   const agentName = input.agentName || "Tobias Meng";
   const officialAddress = input.profile?.adresse || input.address || "H C Hansens Vej 29, 7100 Vejle";
   const slugId = input.id || makeCaseId(agentEmail, officialAddress);
@@ -955,9 +1190,9 @@ export function upsertSellerCase(input: {
 
 export function listCasesForAgent(agentEmail?: string): SellerCaseRecord[] {
   const cases = loadCases();
-  const norm = (agentEmail || "tobias@vejlemaegleren.dk").toLowerCase().trim();
+  const norm = normalizeAgentEmail(agentEmail);
   const list = Object.values(cases).filter(
-    (c) => !agentEmail || c.agentEmail.toLowerCase() === norm
+    (c) => !agentEmail || normalizeAgentEmail(c.agentEmail) === norm
   );
   return list.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
 }

@@ -2307,8 +2307,9 @@ export async function buildFullPropertyProfile(
     if (kAreal > 0 || etBet.includes("kl") || etBet.includes("kælder")) {
       kaelderArealM2 += kAreal || Number(et.eta020SamletArealAfEtage || 0);
       lovligBeboelseKaelderM2 += kLovlig;
-    } else if (tagAreal > 0 || etBet.includes("tag") || etBet === "1") {
-      if (tagAreal > 0) udnyttetTagetageM2 += tagAreal;
+    } else if (tagAreal > 0 || etBet.includes("tag") || etBet === "1" || etBet === "1." || etBet === "1. sal") {
+      const firstFloorM2 = tagAreal || Number(et.eta020SamletArealAfEtage || 0);
+      if (firstFloorM2 > 0) udnyttetTagetageM2 += firstFloorM2;
     }
   }
 
@@ -2407,7 +2408,16 @@ export async function buildFullPropertyProfile(
   const bebyggetArealHovedbygningM2 = Number(
     mainBuilding?.byg041BebyggetAreal || mainBuilding?.byg038SamletBygningsareal || boligarealM2 || 0
   );
-  const antalEtager = Number(mainBuilding?.byg054AntalEtager || 1) || 1;
+  if (
+    !isApartment &&
+    udnyttetTagetageM2 === 0 &&
+    bebyggetArealHovedbygningM2 > 0 &&
+    boligarealM2 > bebyggetArealHovedbygningM2 + lovligBeboelseKaelderM2
+  ) {
+    udnyttetTagetageM2 = Math.max(0, boligarealM2 - bebyggetArealHovedbygningM2 - lovligBeboelseKaelderM2);
+  }
+  const antalEtager =
+    Number(mainBuilding?.byg054AntalEtager || (udnyttetTagetageM2 > 0 ? 2 : 1)) || (udnyttetTagetageM2 > 0 ? 2 : 1);
   const antalVaerelser = Number(mainEnhed?.enh031AntalVaerelser || 0) || null;
   const antalBadevaerelser =
     Number(mainEnhed?.enh066AntalBadevaerelser || 0) ||
@@ -2814,10 +2824,10 @@ export async function buildFullPropertyProfile(
     },
   ];
 
-  // Visuel pakke URLs
+  // Visuel pakke URLs (tæt zoom på ejendommen)
   const eRound = Math.round(easting);
   const nRound = Math.round(northing);
-  const bbox25832 = `${eRound - 85},${nRound - 60},${eRound + 85},${nRound + 60}`;
+  const bbox25832 = `${eRound - 42},${nRound - 28},${eRound + 42},${nRound + 28}`;
   const dfKey = getDatafordelerKeys()[0] || "";
   const ortofotoWmsUrl = dfKey
     ? `https://wms.datafordeler.dk/GeoDanmarkOrto/orto_foraar/1.0.0/WMS?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=orto_foraar&STYLES=&CRS=EPSG:25832&BBOX=${bbox25832}&WIDTH=1000&HEIGHT=650&FORMAT=image/jpeg&apikey=${encodeURIComponent(

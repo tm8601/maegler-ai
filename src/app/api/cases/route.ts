@@ -87,6 +87,7 @@ export async function POST(request: Request) {
       agentEmail: body.agentEmail,
       agentName: body.agentName,
       address: body.address || "H C Hansens Vej 29, 7100 Vejle",
+      profile: body.profile,
       sellerName: body.sellerName,
       sellerEmail: body.sellerEmail,
       status: body.status,
@@ -104,7 +105,13 @@ export async function POST(request: Request) {
       assistantMessages: body.assistantMessages,
       analysisReport: body.analysisReport,
     });
-    return NextResponse.json(record);
+    const agentCases = listCasesForAgent(record.agentEmail).map(
+      ({ profileSnapshot: _, ...summary }) => summary
+    );
+    return NextResponse.json({
+      ...record,
+      agentCases,
+    });
   } catch (error: any) {
     return NextResponse.json(
       { error: error.message || "Kunne ikke gemme sag" },

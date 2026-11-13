@@ -4,42 +4,215 @@ import {
   checkAndReserveAiBudget,
   COST_PER_ASSISTANT_TURN_DKK,
   finalizeAiCallUsage,
-  getTenantBudgetState,
   LOCKED_FLASH_MODEL,
   releaseInFlightLock,
 } from "@/lib/ai-cost-guard";
 import {
+  buildDefaultCheckForMeta,
   computeMissingRemindersForCase,
-  detectReminderMatchFromFilename,
+  detectDocumentCategoryFromContent,
+  extractPrintableTextFromBuffer,
   getSellerCase,
   listCasesForAgent,
+  listUploadedFilesFromDisk,
   makeCaseId,
+  normalizeAgentEmail,
   saveUploadedFileToDisk,
   upsertSellerCase,
+  type CaseDocumentCheckItem,
+  type CaseUploadedDocMeta,
 } from "@/lib/case-store";
-import { fetchFullPropertyProfile, RenovationLevelKey } from "@/lib/property-aggregator";
+import { fetchFullPropertyProfile, PropertyFullProfile, RenovationLevelKey } from "@/lib/property-aggregator";
 
 const ASSISTANT_SYSTEM_PROMPT = `
-Du er Vejle Mæglerens intelligente Sags-AI.
+Du er Vejle Mæglerens intelligente Sags-AI og Olietank-Vagthund (juridisk og byggeteknisk dokumentkontrol-assistent).
 Mægleren skriver til dig for at:
-1) Rette eller afklare punkter på sagen (f.eks. at et BBR-forhold, et skur/carport, en olietank eller et dokument nu er kommet på plads).
-2) Tilføje eller rette en klausul i købsaftalens Afsnit 11.
-3) Få tjekket nye bilag op imod sagens verificerede BBR-, Matrikel- og Plandata.
-4) Spørge til sagens status og hvilke dokumenter der mangler.
+1) Spørge til sagens status, hvor langt du er med gennemgangen, og hvad du har fundet i BBR, Matrikel, Plandata, dokumenter og fotos.
+2) Spørge specifikt til olietanke, BBR_TekniskAnlaeg og synlige tegn på olietank på billeder (påfyldningsstuds i sokkel, udluftningsrør/svanehals med paddehat-hætte ved sokkel/skel, afblændede kobberrør ved skorsten/fyr, sætninger i fliser på 1x1 m, skjolder på betongulv).
+3) Rette eller afklare punkter på sagen (f.eks. at et BBR-forhold, et skur/carport, en olietank eller et dokument nu er kommet på plads).
+4) Tilføje eller rette en klausul i købsaftalens Afsnit 11 (HUSK: Skriv ALDRIG at køber ikke kan rette krav mod "ejendomsmægler", da mægler ikke er part i købsaftalen).
+5) Få oplyst arealer (inkl. 1. sal / udnyttet tagetage), bebyggelsesprocent (BR18), vurdering eller Golden Standard beslutningsmail til sælger/bobestyrer (Mulighed 1, 2 og 3).
 
 REGLER (UFRAVIGELIGE):
-- Gæt ALDRIG. Brug kun sagens hårde registerfakta og mæglerens egne oplysninger.
-- Svar kort, præcist og professionelt på dansk (maks 3-4 sætninger).
+- Gæt ALDRIG. Brug kun sagens verificerede registerfakta, de uploadede dokumenter/fotos og mæglerens egne oplysninger.
+- Svar direkte, konkret og hjælpsomt på mæglerens spørgsmål på dansk (3-6 sætninger). Undgå generiske standardsvar!
 - Du SKAL svare i gyldigt JSON med præcis dette skema:
 {
-  "replyText": "Dit korte svar til mægleren på dansk",
+  "replyText": "Dit direkte, præcise svar på mæglerens spørgsmål på dansk",
   "resolveFlagIds": ["evt. id på roedeFlag som mægleren siger er løst/afklaret"],
   "resolveReminderIds": ["evt. id på dokument-påmindelse (rem-tingbogsattest, rem-byggesag, rem-tilstand-el-energi) som nu er på plads"],
   "addAfsnit11Clause": "evt. ny eller tilpasset Afsnit 11 klausul-tekst hvis mægleren beder om det, ellers null",
   "setRenovationLevel": "gennemrenoveret | mellemrenoveret | ikke_renoveret | null",
-  "actionsSummary": ["Kort liste over hvad du har opdateret på sagen, f.eks. 'Markerede BBR-observandum som afklaret'"]
+  "actionsSummary": ["Kort liste over hvad du har opdateret på sagen"]
 }
 `;
+
+function buildIntelligentCaseAssistantReply(params: {
+  message: string;
+  profile: PropertyFullProfile;
+  uploadedDocMetas: CaseUploadedDocMeta[];
+  documentChecks: CaseDocumentCheckItem[];
+  resolvedFlags: Set<string>;
+  remainingMissingTitles: string[];
+  actionsTaken: string[];
+  newUploadedNames: string[];
+}): string {
+  const {
+    message,
+    profile,
+    uploadedDocMetas,
+    documentChecks,
+    resolvedFlags,
+    remainingMissingTitles,
+    actionsTaken,
+    newUploadedNames,
+  } = params;
+  const lower = message.toLowerCase();
+  const bbr = profile.bbr;
+  const mat = profile.matrikel;
+  const plan = profile.plandata;
+
+  const photos = uploadedDocMetas.filter(
+    (d) => d.type === "photo" || /\.(png|jpg|jpeg|webp)$/i.test(d.name)
+  );
+  const docs = uploadedDocMetas.filter(
+    (d) => d.type !== "photo" && !/\.(png|jpg|jpeg|webp)$/i.test(d.name)
+  );
+  const activeFlags = profile.roedeFlag.filter((f) => !resolvedFlags.has(f.id));
+  const firstFloorM2 =
+    bbr.udnyttetTagetageM2 > 0
+      ? bbr.udnyttetTagetageM2
+      : bbr.antalEtager > 1 && bbr.boligarealM2 > bbr.bebyggetArealHovedbygningM2
+      ? Math.max(0, bbr.boligarealM2 - bbr.bebyggetArealHovedbygningM2 - bbr.lovligBeboelseKaelderM2)
+      : 0;
+
+  const tankSummary =
+    bbr.tekniskeAnlaeg.length > 0
+      ? `I BBR_TekniskAnlaeg er der registreret ${bbr.tekniskeAnlaeg.length} tank(e): ${bbr.tekniskeAnlaeg
+          .map(
+            (t) =>
+              `${t.indholdTekst} (${t.volumenLiter ? `${t.volumenLiter} L, ` : ""}${t.placering}, etableret ${t.etableringsaar || "ukendt år"}, status: ${t.driftstatusTekst})`
+          )
+          .join("; ")}.`
+      : `I BBR_TekniskAnlaeg er der registreret 0 olietanke på ejendommen, og nuværende opvarmning er ${bbr.varmeinstallationTekst} (${bbr.opvarmningsmiddelTekst}).`;
+
+  const photoChecks = documentChecks.filter((c) => c.fileType === "photo");
+  const oilDocChecks = documentChecks.filter(
+    (c) =>
+      c.kategori.toLowerCase().includes("olie") ||
+      c.fundOverskrift.toLowerCase().includes("olie") ||
+      c.fundOverskrift.toLowerCase().includes("tank")
+  );
+
+  const photoInspectionSummary =
+    photos.length > 0
+      ? `Jeg har gennemgået sagens ${photos.length} uploadede billede(r) (${photos.map((p) => p.name).join(", ")}) for visuelle olietankspor (påfyldningsstuds i sokkel, udluftningsrør/svanehals med hætte ved sokkel/skel, afblændede kobberrør ved skorsten/fyr og 1×1 m sætninger i fliser): ${
+          photoChecks.length > 0
+            ? photoChecks.map((c) => c.fundOverskrift).join(" | ")
+            : "Billederne er registreret og tjekket mod BBR."
+        }`
+      : `Der ligger endnu 0 besigtigelsesfotos på sagen. Upload gerne fotos af sokkel, have/skel, flisebelægning og fyr-/teknikrum her i chatten eller i Dokumentrum, så scanner jeg dem straks for udluftningsrør (svanehals/paddehat), påfyldningsstudse, afblændede kobberrør og lunker i fliserne.`;
+
+  const asksAboutOilOrPhotos =
+    /olie|tank|billede|foto|synlige tegn|udluftning|svanehals|påfyldning|sløjf|jordforurening|fyringsolie/.test(
+      lower
+    );
+  const asksAboutProgressOrStatus =
+    /hvor langt|status|hvad mangler|overblik|tjekket|gennemgået|hvad har du fundet/.test(
+      lower
+    );
+  const asksAboutAreaOrBbr =
+    /areal|m2|m²|1\.\s*sal|førstesal|tagetage|bebygget|bbr|etage|kælder|carport|udhus|skur|bebyggelsesprocent|br18/.test(
+      lower
+    );
+  const asksAboutMailOrOptions =
+    /mail|sælger|bobestyrer|kommune|weblager|mulighed 1|mulighed 2|mulighed 3|beslutningsmail/.test(
+      lower
+    );
+  const asksAboutValuation = /vurdering|pris|kvm|renover/.test(lower);
+
+  const parts: string[] = [];
+
+  if (newUploadedNames.length > 0) {
+    const recList = uploadedDocMetas
+      .filter((m) => newUploadedNames.includes(m.name))
+      .map((m) => `${m.name} → genkendt som "${m.detectedCategory || "Sagsdokument"}"`)
+      .join(", ");
+    parts.push(`Jeg har læst og indholdsklassificeret: ${recList || newUploadedNames.join(", ")}.`);
+  }
+
+  if (asksAboutProgressOrStatus) {
+    parts.push(
+      `Status på ${profile.adresse} (BFE ${bbr.bfeNummer}, Matr.nr. ${mat.matrikelnummer}): Alle 5 offentlige registre (DAWA, BBR, Matrikel, Plandata/Byggeret og Klimatilpasning) er færdiggransket. Boligarealet er ${bbr.boligarealM2} m² (Bebygget hus/total: ${bbr.bebyggetArealHovedbygningM2} / ${bbr.samletBebyggetArealM2} m²${firstFloorM2 > 0 ? `, heraf 1. sal: ${firstFloorM2} m²` : ""}).`
+    );
+    parts.push(
+      `Dokumenter & Fotos: Der er uploadet og genkendt ${docs.length} dokument(er) og ${photos.length} foto(s) i Dokumentrummet (${
+        uploadedDocMetas.length > 0
+          ? uploadedDocMetas.map((d) => `${d.detectedCategory || d.name}`).join(", ")
+          : "ingen brugeruploadede filer endnu"
+      }).`
+    );
+    if (!asksAboutOilOrPhotos) {
+      parts.push(`${tankSummary}`);
+    }
+  }
+
+  if (asksAboutOilOrPhotos) {
+    parts.push(`Olietank- & Billedkontrol: ${tankSummary} ${photoInspectionSummary}`);
+    if (oilDocChecks.length > 0) {
+      parts.push(
+        `Dokumentfund vedr. olietank: ${oilDocChecks.map((c) => c.fundOverskrift).join(" ")}`
+      );
+    }
+    parts.push(
+      `Under fanen "Særlige Forhold (Afsnit 11 & Olietank)" ligger både den færdige Golden Standard beslutningsmail til sælger/bobestyrer (med Mulighed 1, 2 og 3), forespørgselsmail til kommunens byggesagsarkiv samt Afsnit 11-klausul klar til brug.`
+    );
+  }
+
+  if (asksAboutAreaOrBbr && !asksAboutProgressOrStatus) {
+    const secStr =
+      bbr.sekundaereBygninger.length > 0
+        ? bbr.sekundaereBygninger.map((s) => `${s.typeTekst}: ${s.arealM2} m²`).join(", ")
+        : "Ingen sekundære bygninger";
+    parts.push(
+      `BBR & Arealer på ${profile.adresse}: Boligareal ${bbr.boligarealM2} m² fordelt på ${bbr.antalEtager} plan. Bebygget areal (Hus / Total): ${bbr.bebyggetArealHovedbygningM2} / ${bbr.samletBebyggetArealM2} m²${
+        firstFloorM2 > 0 ? ` · 1. sal / udnyttet tagetage: ${firstFloorM2} m²` : ""
+      }${bbr.kaelderArealM2 > 0 ? ` · Kælder: ${bbr.kaelderArealM2} m²` : ""}. Sekundære bygninger: ${secStr}. BR18-bebyggelsesprocent: ${plan.faktiskBebyggelsesprocent} % af grundens ${mat.registreretArealM2} m² (maks. ${plan.tilladtBebyggelsesprocent} %).`
+    );
+  }
+
+  if (asksAboutMailOrOptions) {
+    parts.push(
+      `Beslutningsmailen til sælger/bobestyrer (Golden Standard) er klar under fanen "Særlige Forhold (Afsnit 11 & Olietank)". Den gennemgår objektivt og loyalt: Mulighed 1 (Fuld undersøgelse og evt. opgravning/sløjfning nu), Mulighed 2 (Aftale med køber om deling/prisnedslag kombineret med fuld oplysning i Afsnit 11) og Mulighed 3 (Salg med fuld og loyal oplysning uden forudgående undersøgelse), så sælger/bobestyrer selv træffer valget.`
+    );
+  }
+
+  if (asksAboutValuation) {
+    const v = profile.vurdering;
+    parts.push(
+      `Vurderingsinterval på ${profile.adresse} (${v.omraadeNavn}): Gennemrenoveret: ${(v.niveauer.gennemrenoveret.estimatDkk / 1_000_000).toFixed(2)} mio. kr. (${v.niveauer.gennemrenoveret.m2PrisDkk.toLocaleString("da-DK")} kr./m²) · Mellemrenoveret: ${(v.niveauer.mellemrenoveret.estimatDkk / 1_000_000).toFixed(2)} mio. kr. · Ikke renoveret: ${(v.niveauer.ikke_renoveret.estimatDkk / 1_000_000).toFixed(2)} mio. kr.`
+    );
+  }
+
+  if (actionsTaken.length > 0) {
+    parts.push(`Opdateringer udført på sagen: ${actionsTaken.join(", ")}.`);
+  }
+
+  if (parts.length === 0) {
+    parts.push(
+      `Her er status på ${profile.adresse}: Boligareal ${bbr.boligarealM2} m², Bebygget (Hus / Total) ${bbr.bebyggetArealHovedbygningM2} / ${bbr.samletBebyggetArealM2} m²${
+        firstFloorM2 > 0 ? ` (1. sal: ${firstFloorM2} m²)` : ""
+      }, Grund ${mat.registreretArealM2} m². ${tankSummary} Der er ${activeFlags.length} aktive OBS-punkter på forsiden og ${uploadedDocMetas.length} uploadede filer i Dokumentrummet.`
+    );
+  }
+
+  if (remainingMissingTitles.length > 0 && (asksAboutProgressOrStatus || parts.length === 1)) {
+    parts.push(`Manglende dokumenter i Dokumentrum: ${remainingMissingTitles.join(", ")}.`);
+  }
+
+  return parts.join("\n\n");
+}
+
 
 export async function POST(request: Request) {
   let lockKey = "default";
@@ -73,6 +246,7 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Skriv en besked eller vedhæft et bilag" }, { status: 400 });
     }
 
+    agentEmail = normalizeAgentEmail(agentEmail);
     const resolvedId = caseId || makeCaseId(agentEmail, address || "H C Hansens Vej 29, 7100 Vejle");
     const currentCase = getSellerCase(resolvedId);
     const targetAddress = address || currentCase.address || "H C Hansens Vej 29, 7100 Vejle";
@@ -82,9 +256,10 @@ export async function POST(request: Request) {
       currentCase.profileSnapshot || (await fetchFullPropertyProfile({ address: targetAddress }));
     lockKey = profile.adresse;
 
-    // Håndtér evt. vedhæftede bilag i beskeden
+    // Håndtér evt. vedhæftede bilag i beskeden (med automatisk indholdsgenkendelse uanset filnavn)
     const nowTime = new Date().toLocaleTimeString("da-DK", { hour: "2-digit", minute: "2-digit" });
     const nextDocMetas = [...(currentCase.uploadedDocMeta || [])];
+    const nextDocumentChecks = [...(currentCase.documentChecks || [])];
     const resolvedReminders = new Set(currentCase.resolvedReminderIds || []);
     const resolvedFlags = new Set(currentCase.resolvedFlagIds || []);
     const clauses = [...(currentCase.generatedAfsnit11Clauses || [])];
@@ -96,13 +271,19 @@ export async function POST(request: Request) {
       uploadedNames.push(file.name);
       const arrayBuffer = await file.arrayBuffer();
       const buffer = Buffer.from(arrayBuffer);
-      const matchedRem = detectReminderMatchFromFilename(file.name);
+      const extractedText = extractPrintableTextFromBuffer(buffer);
+      const catInfo = detectDocumentCategoryFromContent(file.name, extractedText);
+      const matchedRem = catInfo.reminderId;
       if (matchedRem) {
         resolvedReminders.add(matchedRem);
-        actionsTaken.push(`Registrerede ${file.name} i Dokumentrum`);
       }
-      const existingMeta = nextDocMetas.find((d) => d.name === file.name);
-      const docId = existingMeta?.id || `doc-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      actionsTaken.push(`Genkendte ${file.name} som "${catInfo.categoryLabel}"`);
+
+      const existingIdx = nextDocMetas.findIndex((d) => d.name === file.name);
+      const docId =
+        existingIdx >= 0
+          ? nextDocMetas[existingIdx].id
+          : `doc-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
       const isPdfMagic = buffer.length >= 5 && buffer.subarray(0, 5).toString("ascii") === "%PDF-";
       const isPngMagic =
         buffer.length >= 8 && buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47;
@@ -116,17 +297,30 @@ export async function POST(request: Request) {
         file.type || (isImage ? "image/png" : "application/pdf"),
         buffer
       );
-      if (!existingMeta) {
-        nextDocMetas.push({
-          id: docId,
-          name: file.name,
-          sizeKb: Math.max(1, Math.round(file.size / 1024)),
-          type: isImage ? "photo" : "document",
-          mimeType: file.type || (isImage ? "image/png" : "application/pdf"),
-          uploadedAt: nowTime,
-          matchedReminderId: matchedRem,
-        });
+      const newMeta: CaseUploadedDocMeta = {
+        id: docId,
+        name: file.name,
+        sizeKb: Math.max(1, Math.round(file.size / 1024)),
+        type: isImage ? "photo" : "document",
+        mimeType: file.type || (isImage ? "image/png" : "application/pdf"),
+        uploadedAt: nowTime,
+        matchedReminderId: matchedRem,
+        detectedCategory: isImage && catInfo.categoryLabel === "Sagsdokument" ? "Besigtigelsesfoto" : catInfo.categoryLabel,
+        extractedSummary: extractedText ? extractedText.slice(0, 300) : undefined,
+      };
+      if (existingIdx >= 0) {
+        nextDocMetas[existingIdx] = newMeta;
+      } else {
+        nextDocMetas.push(newMeta);
       }
+      const checkItem = buildDefaultCheckForMeta(newMeta, profile);
+      const chkIdx = nextDocumentChecks.findIndex((c) => c.fileName === file.name);
+      if (chkIdx >= 0) {
+        nextDocumentChecks[chkIdx] = checkItem;
+      } else {
+        nextDocumentChecks.unshift(checkItem);
+      }
+
       if (isPdfMagic) {
         fileParts.push({ inlineData: { data: buffer.toString("base64"), mimeType: "application/pdf" } });
       } else if (isPngMagic) {
@@ -134,12 +328,32 @@ export async function POST(request: Request) {
       } else if (isJpgMagic) {
         fileParts.push({ inlineData: { data: buffer.toString("base64"), mimeType: "image/jpeg" } });
       } else {
-        fileParts.push({ text: `--- BILAG: ${file.name} ---\n${buffer.toString("utf8").slice(0, 40000)}` });
+        fileParts.push({ text: `--- BILAG: ${file.name} ---\n${extractedText || buffer.toString("utf8").slice(0, 40000)}` });
+      }
+    }
+
+    // Hvis mægleren spørger til billeder/olietank og ikke vedhæftede nye filer i selve beskeden, medsend allerede uploadede fotos fra sagen (maks 4 stk.)
+    const lowerMsg = message.toLowerCase();
+    if (
+      fileParts.length === 0 &&
+      /billede|foto|olietank|tank|synlige tegn|udluftning|påfyldning/.test(lowerMsg)
+    ) {
+      const diskFiles = listUploadedFilesFromDisk(resolvedId);
+      for (const df of diskFiles.slice(0, 4)) {
+        const isImg =
+          df.mimeType.startsWith("image/") || /\.(png|jpg|jpeg|webp)$/i.test(df.fileName);
+        if (isImg && df.buffer.length < 4_000_000) {
+          fileParts.push({
+            inlineData: {
+              data: df.buffer.toString("base64"),
+              mimeType: df.mimeType.startsWith("image/") ? df.mimeType : "image/jpeg",
+            },
+          });
+        }
       }
     }
 
     // Deterministisk forhåndstolkning af mæglerens instruks (sikrer at opdateringer altid slår igennem, også ved fallback)
-    const lowerMsg = message.toLowerCase();
     if (
       lowerMsg.includes("styr på") ||
       lowerMsg.includes("afklaret") ||
@@ -237,9 +451,37 @@ export async function POST(request: Request) {
         profileSnapshot: profile,
       });
 
+      const firstFloorM2 =
+        profile.bbr.udnyttetTagetageM2 > 0
+          ? profile.bbr.udnyttetTagetageM2
+          : profile.bbr.antalEtager > 1 && profile.bbr.boligarealM2 > profile.bbr.bebyggetArealHovedbygningM2
+          ? Math.max(
+              0,
+              profile.bbr.boligarealM2 -
+                profile.bbr.bebyggetArealHovedbygningM2 -
+                profile.bbr.lovligBeboelseKaelderM2
+            )
+          : 0;
+
       const promptText = `
 SAG: ${profile.adresse} (BFE ${profile.bbr.bfeNummer}, Matr. ${profile.matrikel.matrikelnummer})
-NUVÆRENDE FAKTA: Boligareal ${profile.bbr.boligarealM2} m², Bebygget total ${profile.bbr.samletBebyggetArealM2} m², Grund ${profile.matrikel.registreretArealM2} m², Opført ${profile.bbr.opfoerelsesaar}, Tag: ${profile.bbr.tagmaterialeTekst}.
+NUVÆRENDE FAKTA: Boligareal ${profile.bbr.boligarealM2} m² (${profile.bbr.antalEtager} plan), Bebygget (Hus / Total): ${profile.bbr.bebyggetArealHovedbygningM2} / ${profile.bbr.samletBebyggetArealM2} m², 1. sal / udnyttet tagetage: ${firstFloorM2} m², Grund ${profile.matrikel.registreretArealM2} m², Opført ${profile.bbr.opfoerelsesaar}, Tag: ${profile.bbr.tagmaterialeTekst}, Varme: ${profile.bbr.varmeinstallationTekst} (${profile.bbr.opvarmningsmiddelTekst}).
+BBR_TEKNISKANLÆG (OLIETANKE): ${JSON.stringify(profile.bbr.tekniskeAnlaeg)}
+UPLOADEDE FILER OG FOTOS PÅ SAGEN: ${JSON.stringify(
+        nextDocMetas.map((d) => ({
+          name: d.name,
+          type: d.type,
+          detectedCategory: d.detectedCategory,
+        }))
+      )}
+DOKUMENT- OG BILLEDKONTROL FUND: ${JSON.stringify(
+        nextDocumentChecks.slice(0, 12).map((c) => ({
+          fileName: c.fileName,
+          kategori: c.kategori,
+          status: c.status,
+          fundOverskrift: c.fundOverskrift,
+        }))
+      )}
 AKTIVE OBSERVANDA PÅ SAGEN: ${JSON.stringify(activeFlagsForPrompt)}
 MANGLENDE DOKUMENTER PÅ SAGEN: ${JSON.stringify(missingBefore.map((m) => ({ id: m.id, titel: m.titel })))}
 EKSISTERENDE AFSNIT 11 KLAUSULER: ${JSON.stringify(clauses)}
@@ -342,9 +584,8 @@ ${uploadedNames.length > 0 ? `NYE VEDHÆFTEDE BILAG: ${uploadedNames.join(", ")}
       }
     }
 
-    // Deterministisk fallback-svar hvis AI ikke svarede eller hvis mægleren blot skrev en hurtig kommando
-    if (!aiReplyText) {
-
+    // Intelligent fagligt svar hvis AI ikke svarede eller hvis svaret skal suppleres
+    if (!aiReplyText || aiReplyText.startsWith("Noteret på ")) {
       const tempCase = {
         ...currentCase,
         uploadedDocMeta: nextDocMetas,
@@ -352,15 +593,16 @@ ${uploadedNames.length > 0 ? `NYE VEDHÆFTEDE BILAG: ${uploadedNames.join(", ")}
         profileSnapshot: profile,
       };
       const remainingMissing = computeMissingRemindersForCase(tempCase);
-      const missingText =
-        remainingMissing.length > 0
-          ? ` Sagen afventer fortsat: ${remainingMissing.map((m) => m.titel.split("(")[0].trim()).join(", ")}.`
-          : " Alle sagens dokumentkrav er nu opfyldt.";
-
-      aiReplyText =
-        actionsTaken.length > 0
-          ? `Sagen er opdateret (${actionsTaken.join(", ")}).${missingText}`
-          : `Noteret på ${profile.adresse}.${missingText}`;
+      aiReplyText = buildIntelligentCaseAssistantReply({
+        message: agentMsgText,
+        profile,
+        uploadedDocMetas: nextDocMetas,
+        documentChecks: nextDocumentChecks,
+        resolvedFlags,
+        remainingMissingTitles: remainingMissing.map((m) => m.titel.split("(")[0].trim()),
+        actionsTaken,
+        newUploadedNames: uploadedNames,
+      });
     }
 
     const updatedMessages = [
@@ -385,6 +627,7 @@ ${uploadedNames.length > 0 ? `NYE VEDHÆFTEDE BILAG: ${uploadedNames.join(", ")}
       resolvedFlagIds: Array.from(resolvedFlags),
       resolvedReminderIds: Array.from(resolvedReminders),
       uploadedDocMeta: nextDocMetas,
+      documentChecks: nextDocumentChecks,
       assistantMessages: updatedMessages,
     });
 

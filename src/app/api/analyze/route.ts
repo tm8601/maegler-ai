@@ -21,7 +21,9 @@ import {
   CaseDocumentCheckItem,
   CaseUploadedDocMeta,
   computeMissingRemindersForCase,
+  detectDocumentCategoryFromContent,
   detectReminderMatchFromFilename,
+  extractPrintableTextFromBuffer,
   FloorplanCalculation,
   getSellerCase,
   listUploadedFilesFromDisk,
@@ -31,19 +33,20 @@ import {
 } from "@/lib/case-store";
 
 const BOLIGHANDEL_ANALYSIS_SYSTEM_PROMPT = `
-Du er en dansk juridisk og teknisk ejendomsmægler-revisor (Cand.jur. & Bygningskonstruktør).
+Du er en dansk juridisk og teknisk ejendomsmægler-revisor (Cand.jur. & Bygningskonstruktør) samt Olietank-Vagthund.
 Din opgave er aktivt at gennemgå hvert eneste vedhæftede dokument, plantegning og foto og krydstjekke det 1:1 mod ejendommens autoritative registerdata (BBR, Matrikel, Tingbog, Plandata).
 
 STRENGE REGLER:
-1. GÆT ALDRIG: Brug kun verificerede registerdata og det faktiske indhold i de uploadede dokumenter/fotos.
-2. BILLEDKONTROL (FOTOS MOD BBR & BYGGESAG):
-   - Hvis en fil er et foto af ejendommen, tjek om tagmateriale, facademateriale (ydervæg), antal etager og sekundære bygninger (carport, udhus, overdækket terrasse, udestue) stemmer overens med BBR og byggesager.
-   - Hvis der ses uoverensstemmelser (f.eks. uregistreret overdækning/udestue eller andet tagmateriale end BBR), markér status som "afvigelse" eller "opmaerksomhed" og formulér et konkret forslag til Købsaftalens Afsnit 11.
+1. AUTOMATISK DOKUMENTGENKENDELSE PÅ INDHOLD (IGNORÉR FILNAVN):
+   - Du SKAL identificere dokumenttypen ud fra selve dokumentets indhold/tekst/billede, selv hvis filen hedder noget helt tilfældigt (f.eks. "scan001.pdf", "dokument.pdf", "IMG_4821.jpg").
+   - Kategorisér præcist som: "Tingbogsattest & Servitutter", "Byggesagsarkiv / Byggetilladelse", "Plantegning (L×B mod BBR ±15 %)", "Tilstandsrapport", "Elinstallationsrapport", "Energimærke", "Olietank- & Miljødokumentation", "Ejendomsdatarapport / Jordforurening", "BBR-Meddelelse" eller "Billedkontrol (Olietankspor & BBR)".
+2. BILLEDKONTROL & OLIETANK-VAGTHUND (FOTOS MOD BBR & OLIETANKSPOR):
+   - Scan altid fotos for synlige tegn på olietank: (a) påfyldningsstuds i sokkel/facade, (b) udluftningsrør / svanehals / paddehat ved sokkel, gavl, hæk eller naboskel, (c) cirkulære dæksler eller 1x1 m sætninger i fliser/græs, (d) afblændede kobberrør med kompressionsfitting ved gulv/væg/skorsten, (e) fritstående tank i kælder/udhus.
+   - Tjek samtidig om tagmateriale, facademateriale (ydervæg), antal etager og sekundære bygninger (carport, udhus, overdækket terrasse, udestue) stemmer med BBR.
 3. PLANTEGNINGSKONTROL (L×B MOD BBR INDEN FOR ±15 %):
-   - Hvis en fil er en plantegning (eller indeholder rum-/bygningsmål L×B), aflæs de indvendige mål (længde L og bredde B i meter, samt antal indvendige skillevægge eller rumliste).
-   - Husk at plantegninger typisk angiver indvendige mål: Der tillægges 10 cm (0,10 m) pr. indervæg/skillevæg og 35 cm (0,35 m) pr. ydervæg for at beregne BBR-bruttoarealet, som skal ligge inden for ±15 % af BBR-boligarealet.
-4. KØBSAFTALENS AFSNIT 11:
-   - Formulér konkrete, skarpe og kopieringsklare klausuler til Købsaftalens Afsnit 11 for alle relevante fund i dokumenter, billeder, plantegninger og BBR.
+   - Hvis en fil er en plantegning, aflæs de indvendige mål (længde L og bredde B i meter samt antal skillevægge). Der tillægges 10 cm pr. indervæg og 35 cm pr. ydervæg for BBR-bruttoarealet (±15 % tolerance).
+4. KØBSAFTALENS AFSNIT 11 (INGEN ULOVLIG MÆGLER-FRASKRIVELSE):
+   - Formulér konkrete, kopieringsklare klausuler til Købsaftalens Afsnit 11. Skriv ALDRIG at køber ikke kan rette krav mod "ejendomsmægler" (kun mod sælger/boet ved loyal oplysning).
 
 Returnér ALTID gyldig JSON med præcis denne struktur:
 {
@@ -52,11 +55,11 @@ Returnér ALTID gyldig JSON med præcis denne struktur:
       "fileName": "navn på fil",
       "fileType": "document" | "photo" | "floorplan",
       "status": "ok" | "opmaerksomhed" | "afvigelse",
-      "kategori": "Tingbog & Servitutter" | "Byggesagsarkiv & BBR" | "Plantegning (L×B mod BBR ±15 %)" | "Billedkontrol (Foto mod BBR & Byggesag)" | "Tilstands-, El- & Energirapport" | "Sagsdokument",
-      "fundOverskrift": "Kort præcis konklusion på tjekket af denne fil",
+      "kategori": "Tingbogsattest & Servitutter" | "Byggesagsarkiv / Byggetilladelse" | "Plantegning (L×B mod BBR ±15 %)" | "Billedkontrol (Olietankspor & BBR)" | "Tilstandsrapport" | "Elinstallationsrapport" | "Energimærke" | "Olietank- & Miljødokumentation" | "Ejendomsdatarapport / Jordforurening" | "BBR-Meddelelse",
+      "fundOverskrift": "Kort præcis konklusion på hvad dokumentet/billedet er og hvad tjekket viste",
       "fundDetaljer": [
-        "Konkret punkt 1 tjekket mod BBR/Byggesag/Tingbog",
-        "Konkret punkt 2 tjekket mod BBR/Byggesag/Tingbog"
+        "Konkret punkt 1 tjekket mod BBR/Byggesag/Tingbog/Olietank",
+        "Konkret punkt 2 tjekket mod BBR/Byggesag/Tingbog/Olietank"
       ],
       "afsnit11Forslag": "Konkret klausultekst til Købsaftalens Afsnit 11 hvis filen giver anledning til forbehold/oplysning, ellers null"
     }
@@ -349,13 +352,14 @@ export async function POST(request: Request) {
       shaParts.push(buffer);
 
       const binaryMime = detectBinaryMimeType(buffer);
-      const fileText = binaryMime ? "" : buffer.toString("utf8").slice(0, 50000);
+      const fileText = extractPrintableTextFromBuffer(buffer);
       rawTextsByFile[file.name] = fileText;
       if (fileText) {
         combinedRawText += `\n--- FIL: ${file.name} ---\n` + fileText;
       }
 
-      const matchedRem = detectReminderMatchFromFilename(file.name);
+      const catInfo = detectDocumentCategoryFromContent(file.name, fileText);
+      const matchedRem = catInfo.reminderId;
       if (matchedRem) {
         resolvedReminders.add(matchedRem);
       }
@@ -384,7 +388,12 @@ export async function POST(request: Request) {
           mimeType: binaryMime || file.type || (isImage ? "image/png" : "application/pdf"),
           uploadedAt: nowTime,
           matchedReminderId: matchedRem,
+          detectedCategory: catInfo.categoryLabel,
+          extractedSummary: fileText.slice(0, 300),
         });
+      } else {
+        existingMeta.matchedReminderId = existingMeta.matchedReminderId || matchedRem;
+        existingMeta.detectedCategory = catInfo.categoryLabel || existingMeta.detectedCategory;
       }
 
       fileParts.push(buildGeminiPartForBuffer(file.name, buffer));
@@ -396,11 +405,19 @@ export async function POST(request: Request) {
       for (const df of diskFiles) {
         fileNames.push(df.fileName);
         shaParts.push(df.buffer);
-        const binaryMime = detectBinaryMimeType(df.buffer);
-        const fileText = binaryMime ? "" : df.buffer.toString("utf8").slice(0, 40000);
+        const fileText = extractPrintableTextFromBuffer(df.buffer);
         rawTextsByFile[df.fileName] = fileText;
         if (fileText) {
           combinedRawText += `\n--- FIL: ${df.fileName} ---\n` + fileText;
+        }
+        const catInfo = detectDocumentCategoryFromContent(df.fileName, fileText);
+        if (catInfo.reminderId) {
+          resolvedReminders.add(catInfo.reminderId);
+        }
+        const metaMatch = newDocMetas.find((m) => m.name === df.fileName);
+        if (metaMatch) {
+          metaMatch.matchedReminderId = metaMatch.matchedReminderId || catInfo.reminderId;
+          metaMatch.detectedCategory = catInfo.categoryLabel || metaMatch.detectedCategory;
         }
         fileParts.push(buildGeminiPartForBuffer(df.fileName, df.buffer));
       }
@@ -616,9 +633,29 @@ Analysér hver enkelt fil/foto/plantegning op imod BBR, Byggesag og Tingbog, og 
             }
           }
 
-          finalChecks = finalChecks.map((detCheck) => {
-            const aiMatch = aiChecksByFile.get(detCheck.fileName.toLowerCase());
+          finalChecks = finalChecks.map((detCheck, idx) => {
+            const aiMatch =
+              aiChecksByFile.get(detCheck.fileName.toLowerCase()) ||
+              (parsedJson.documentChecks.length === finalChecks.length ? parsedJson.documentChecks[idx] : null);
             if (!aiMatch) return detCheck;
+            const resolvedCat = detectDocumentCategoryFromContent(
+              detCheck.fileName,
+              rawTextsByFile[detCheck.fileName] || "",
+              `${aiMatch.kategori || ""} ${aiMatch.fundOverskrift || ""}`
+            );
+            if (resolvedCat.reminderId) {
+              resolvedReminders.add(resolvedCat.reminderId);
+            }
+            const metaRef = newDocMetas.find((m) => m.name.toLowerCase() === detCheck.fileName.toLowerCase());
+            if (metaRef) {
+              metaRef.matchedReminderId = metaRef.matchedReminderId || resolvedCat.reminderId;
+              metaRef.detectedCategory = aiMatch.kategori || resolvedCat.categoryLabel || metaRef.detectedCategory;
+              metaRef.extractedSummary = aiMatch.fundOverskrift || metaRef.extractedSummary;
+              metaRef.checkStatus =
+                aiMatch.status === "afvigelse" || aiMatch.status === "opmaerksomhed" || aiMatch.status === "ok"
+                  ? aiMatch.status
+                  : "ok";
+            }
             return {
               id: detCheck.id,
               fileName: detCheck.fileName,
@@ -635,7 +672,7 @@ Analysér hver enkelt fil/foto/plantegning op imod BBR, Byggesag og Tingbog, og 
                 aiMatch.status === "ok"
                   ? aiMatch.status
                   : detCheck.status,
-              kategori: aiMatch.kategori || detCheck.kategori,
+              kategori: aiMatch.kategori || resolvedCat.categoryLabel || detCheck.kategori,
               fundOverskrift: aiMatch.fundOverskrift || detCheck.fundOverskrift,
               fundDetaljer:
                 Array.isArray(aiMatch.fundDetaljer) && aiMatch.fundDetaljer.length > 0
