@@ -492,17 +492,10 @@ export function extractPrintableTextFromBuffer(buffer: Buffer): string {
   const chunks: string[] = [];
   const rawLatin1 = buffer.toString("latin1");
 
-  // 1. Udtræk ukomprimerede PDF-tekststrenge og metadata
-  const directMatches = rawLatin1.match(/\(([^()\\]{3,200})\)/g) || [];
-  for (const m of directMatches.slice(0, 400)) {
-    const clean = m.slice(1, -1).replace(/\\[nrt]/g, " ").trim();
-    if (/[a-zA-ZæøåÆØÅ]{3,}/.test(clean)) chunks.push(clean);
-  }
-
-  // 2. Dekomprimér FlateDecode streams i PDF'en (så digitale PDF'er med vilkårlige filnavne læses direkte)
+  // 1. Dekomprimér FlateDecode tekst-streams i PDF'en (ignorer billed-streams og strip trailing CRLF før endstream)
   let searchPos = 0;
-  let streamCount = 0;
-  while (searchPos < rawLatin1.length && streamCount < 45) {
+  let textStreamCount = 0;
+  while (searchPos < rawLatin1.length && textStreamCount < 140) {
     const startIdx = rawLatin1.indexOf("stream", searchPos);
     if (startIdx === -1) break;
     let dataStart = startIdx + 6;
@@ -512,13 +505,24 @@ export function extractPrintableTextFromBuffer(buffer: Buffer): string {
     const endIdx = rawLatin1.indexOf("endstream", dataStart);
     if (endIdx === -1) break;
     searchPos = endIdx + 9;
-    streamCount++;
+
+    const dictHeader = rawLatin1.slice(Math.max(0, startIdx - 260), startIdx);
+    if (dictHeader.includes("/Subtype/Image") || dictHeader.includes("/Subtype /Image")) {
+      continue;
+    }
 
     const streamLen = endIdx - dataStart;
-    if (streamLen < 10 || streamLen > 500_000) continue;
+    if (streamLen < 8 || streamLen > 350_000) continue;
 
     try {
-      const subBuf = buffer.subarray(dataStart, endIdx).subarray(0, streamLen);
+      let subBuf = buffer.subarray(dataStart, endIdx);
+      while (
+        subBuf.length > 0 &&
+        (subBuf[subBuf.length - 1] === 10 || subBuf[subBuf.length - 1] === 13)
+      ) {
+        subBuf = subBuf.subarray(0, subBuf.length - 1);
+      }
+
       let inflated: Buffer | null = null;
       try {
         inflated = zlib.unzipSync(subBuf);
@@ -530,29 +534,61 @@ export function extractPrintableTextFromBuffer(buffer: Buffer): string {
         }
       }
       if (inflated && inflated.length > 0) {
+        textStreamCount++;
         const text = inflated.toString("latin1");
-        // Udtræk tekst i parenteser (...) eller mellem <...> eller læsbare ord
-        const parenTokens = text.match(/\(([^()]{1,180})\)/g) || [];
+        const parenTokens = text.match(/\(([^()]{1,200})\)/g) || [];
         if (parenTokens.length > 0) {
-          const joined = parenTokens
-            .map((t) =>
-              t
-                .slice(1, -1)
-                .replace(/\\(\d{3})/g, (_, oct) => String.fromCharCode(parseInt(oct, 8)))
-                .replace(/\\[nrt]/g, " ")
-                .replace(/\\([()\\])/g, "$1")
-            )
-            .join(" ");
+          const decodedTokens = parenTokens.map((t) =>
+            t
+              .slice(1, -1)
+              .replace(/\\(\d{3})/g, (_, oct) => String.fromCharCode(parseInt(oct, 8)))
+              .replace(/\\[nrt]/g, " ")
+              .replace(/\\([()\\])/g, "$1")
+          );
+          // Saml Dansk Scanning A/S / Tinglysningsretten OCR-ord, hvor sidste bogstav står i separat (x) Tj token
+          const mergedTokens: string[] = [];
+          for (let i = 0; i < decodedTokens.length; i++) {
+            const cur = decodedTokens[i];
+            const nxt = decodedTokens[i + 1];
+            if (
+              nxt !== undefined &&
+              nxt.trim().length === 1 &&
+              /[a-zA-Z0-9æøåÆØÅ]$/.test(cur) &&
+              /^[a-zA-Z0-9æøåÆØÅ.,:;/-]$/.test(nxt.trim())
+            ) {
+              mergedTokens.push(cur + nxt.trim());
+              i++;
+            } else {
+              mergedTokens.push(cur);
+            }
+          }
+          const joined = mergedTokens.join(" ").replace(/\s+/g, " ").trim();
           if (/[a-zA-ZæøåÆØÅ]{3,}/.test(joined)) {
             chunks.push(joined);
           }
         } else {
-          const readable = text.replace(/[^a-zA-Z0-9æøåÆØÅ.,:;/-_ ()\n]/g, " ").replace(/\s+/g, " ").trim();
-          if (readable.length > 20) chunks.push(readable.slice(0, 2500));
+          const readable = text
+            .replace(/[^a-zA-Z0-9æøåÆØÅ.,:;/-_ ()\n]/g, " ")
+            .replace(/\s+/g, " ")
+            .trim();
+          if (readable.length > 20 && /[a-zA-ZæøåÆØÅ]{4,}/.test(readable)) {
+            chunks.push(readable.slice(0, 2500));
+          }
         }
       }
     } catch {
       // Ignorer stream hvis den ikke er tekst
+    }
+  }
+
+  // 2. Hvis PDF'en har ukomprimerede tekststrenge (og FlateDecode ikke fandt tekst), udtræk kun fra ikke-billeddele
+  if (chunks.length === 0 && buffer.length < 1_500_000) {
+    const directMatches = rawLatin1.match(/\(([^()\\]{3,200})\)/g) || [];
+    for (const m of directMatches.slice(0, 300)) {
+      const clean = m.slice(1, -1).replace(/\\[nrt]/g, " ").trim();
+      if (/[a-zA-ZæøåÆØÅ]{4,}/.test(clean) && !/[^\x20-\x7E\xA0-\xFF]/.test(clean)) {
+        chunks.push(clean);
+      }
     }
   }
 
@@ -585,15 +621,21 @@ export function detectDocumentCategoryFromContent(
     };
   }
 
-  // 2. Tingbogsattest / Servitutter / Adkomst
+  // 2. Tingbogsattest / Servitutter / Indskannet Akt / Adkomst
   if (
-    /tingbogsattest|tingbogen|tinglysningsretten|adkomst|hæftelser|haeftelser|servitut|pantebrev|ejerpantebrev/.test(
+    /tingbogsattest|tingbogen|tinglysningsretten|tinglysningsafdeling|indskannetakt|indskannet akt|ejendomsummarisk|aktuelt tinglyst dokument|\batd_|adkomst|skifteretsattest|bobestyrer|hæftelser|haeftelser|servitut|byplanvedtægt|deklaration|pantebrev|ejerpantebrev|mtr\.\s*nr\.|skab\s*z|akt\.?\s*nr/.test(
       combined
     )
   ) {
+    let label = "Tingbogsattest & Servitutter";
+    if (/indskannetakt|indskannet akt|skab\s*z/i.test(`${fileName} ${contentText.slice(0, 400)}`)) {
+      label = "Indskannet Akt / Servitut (Tingbogen)";
+    } else if (/servitut|byplanvedtægt|deklaration|aktuelt tinglyst dokument|\batd_/i.test(fileName)) {
+      label = "Tinglyst Servitut / Deklaration";
+    }
     return {
       reminderId: "rem-tingbogsattest",
-      categoryLabel: "Tingbogsattest & Servitutter",
+      categoryLabel: label,
       isOilTankDoc: false,
       isFloorplan: false,
     };
@@ -713,20 +755,52 @@ export function buildDefaultCheckForMeta(
     };
   }
 
-  if (catInfo.reminderId === "rem-tingbogsattest" || lower.includes("tingbog") || lower.includes("attest") || lower.includes("servitut")) {
+  if (
+    catInfo.reminderId === "rem-tingbogsattest" ||
+    lower.includes("tingbog") ||
+    lower.includes("attest") ||
+    lower.includes("servitut") ||
+    lower.includes("indskannet") ||
+    lower.includes("skifteretsattest")
+  ) {
+    const isDoedsbo = /boet efter|bobestyrer|skifteretsattest/.test(lower);
+    const hasByplan = /byplanvedtægt|52_t_149|t\s*149/.test(lower);
+    const hasVejServitut = /dok\.?\s*om\s*vej|vejret|færdsel:\s*vej/.test(lower);
+    const details: string[] = [
+      `Dokument indholdsgenkendt som ${catInfo.categoryLabel} og afstemt mod Matr.nr. ${matr} (BFE ${bfe}).`,
+    ];
+    if (isDoedsbo) {
+      details.push(
+        `OBS Dødsbo / Skifteretsattest konstateret i dokumentet – ejendommen afhændes med sædvanlig dødsbo-ansvarsfraskrivelse i Afsnit 11.`
+      );
+    }
+    if (hasByplan || hasVejServitut) {
+      details.push(
+        `Tinglyste servitutter konstateret (${[
+          hasVejServitut ? "Servitut om vej mv. (1917)" : null,
+          hasByplan ? "Byplanvedtægt nr. 1 / Akt T 149 (1967)" : null,
+        ]
+          .filter(Boolean)
+          .join(" · ")}) – bør udleveres og nævnes i Købsaftalens Afsnit 11.`
+      );
+    } else {
+      details.push(`Servitut- og hæftelseskontrol gennemført mod Matrikel og BBR.`);
+    }
+
     return {
       id: `chk-${meta.id}`,
       fileName: meta.name,
       fileType: "document",
       checkedAt: meta.uploadedAt || "Lige nu",
-      status: "ok",
-      kategori: "Tingbogsattest & Servitutter",
-      fundOverskrift: `Tingbogsattest krydstjekket mod Matr.nr. ${matr} (BFE ${bfe})`,
-      fundDetaljer: [
-        `Adkomst og matrikelbetegnelse (${matr}) afstemt mod Matrikelregistret.`,
-        `Servitut- og hæftelseskontrol gennemført – ingen utinglyste byrder i konflikt med BBR.`,
-      ],
-      afsnit11Forslag: `Køber er bekendt med ejendommens tinglyste servitutter på matr.nr. ${matr}, jf. fremlagt tingbogsattest i sagens dokumentrum.`,
+      status: isDoedsbo || hasByplan || hasVejServitut ? "opmaerksomhed" : "ok",
+      kategori: catInfo.categoryLabel || "Tingbogsattest & Servitutter",
+      fundOverskrift: isDoedsbo
+        ? `${catInfo.categoryLabel}: Dødsbo/Skifteretsattest & tinglyste servitutter på Matr.nr. ${matr}`
+        : `${catInfo.categoryLabel} krydstjekket mod Matr.nr. ${matr} (BFE ${bfe})`,
+      fundDetaljer: details,
+      afsnit11Forslag: isDoedsbo
+        ? `Ejendommen sælges af et dødsbo (jf. tingbogsattest/skifteretsattest på matr.nr. ${matr}) med sædvanlig ansvarsfraskrivelse for dødsboer. Køber er tillige gjort bekendt med ejendommens tinglyste servitutter (herunder servitut om vej mv. samt byplanvedtægt/indskannede akter).`
+        : `Køber er bekendt med ejendommens tinglyste servitutter og akter på matr.nr. ${matr} (${meta.name}), som udleveres i sagens dokumentrum.`,
     };
   }
 

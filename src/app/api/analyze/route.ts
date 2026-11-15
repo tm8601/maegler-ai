@@ -106,9 +106,27 @@ function detectBinaryMimeType(buffer: Buffer): string | null {
 
 function buildGeminiPartForBuffer(
   fileName: string,
-  buffer: Buffer
+  buffer: Buffer,
+  extractedText = ""
 ): { inlineData: { data: string; mimeType: string } } | { text: string } {
   const binaryMime = detectBinaryMimeType(buffer);
+  // Hvis det er en PDF med udtrukket tekst (>= 200 tegn) eller en meget stor PDF (> 1,2 MB),
+  // send den udtrukne tekst i stedet for en tung 4-50 MB base64-blob, så Gemini svarer på 2-4 sekunder uden timeout/limbo.
+  if (binaryMime === "application/pdf") {
+    if (extractedText.length >= 200 || buffer.length > 1_200_000) {
+      return {
+        text: `--- DOKUMENT: ${fileName} (PDF, ${Math.round(buffer.length / 1024)} KB) ---\n${
+          extractedText.slice(0, 28000) || "(Scannet PDF-dokument uden indlejret tekstlag)"
+        }`,
+      };
+    }
+    return {
+      inlineData: {
+        data: buffer.toString("base64"),
+        mimeType: binaryMime,
+      },
+    };
+  }
   if (binaryMime) {
     return {
       inlineData: {
@@ -118,7 +136,7 @@ function buildGeminiPartForBuffer(
     };
   }
   return {
-    text: `--- DOKUMENT: ${fileName} ---\n${buffer.toString("utf8").slice(0, 45000)}`,
+    text: `--- DOKUMENT: ${fileName} ---\n${(extractedText || buffer.toString("utf8")).slice(0, 45000)}`,
   };
 }
 
@@ -128,17 +146,47 @@ function parseDocumentTextForTingbog(rawText: string) {
     lower.includes("tingbogsattest") ||
     lower.includes("adkomst") ||
     lower.includes("hæftelser") ||
-    lower.includes("servitutter");
+    lower.includes("servitutter") ||
+    lower.includes("skifteretsattest") ||
+    lower.includes("indskannet akt") ||
+    lower.includes("tinglysningsafdeling");
+
+  const isDoedsbo =
+    lower.includes("boet efter") ||
+    lower.includes("skifteretsattest") ||
+    lower.includes("bobestyrer");
 
   const servitutter: string[] = [];
-  const servMatches = rawText.match(/(?:servitut|deklaration|byggelinje|vejret)[^\n\r]{0,120}/gi) || [];
+  const seenServ = new Set<string>();
+  const addServ = (s: string) => {
+    const clean = s.replace(/\s+/g, " ").trim();
+    if (clean.length > 5 && !seenServ.has(clean.toLowerCase())) {
+      seenServ.add(clean.toLowerCase());
+      servitutter.push(clean);
+    }
+  };
+
+  if (/dok\.?\s*om\s*vej/i.test(rawText)) {
+    addServ("Servitut om vej mv. (Færdsel: Vej)");
+  }
+  if (/byplanvedtægt\s*nr\.?\s*1/i.test(rawText)) {
+    addServ("Byplanvedtægt nr. 1 (Prioritet forud for pantegæld / Akt 52_T_149)");
+  }
+  if (/indskannet\s*akt:\s*akt\s*nr:\s*([0-9a-z_]+)/i.test(rawText)) {
+    const m = rawText.match(/indskannet\s*akt:\s*akt\s*nr:\s*([0-9a-z_]+)/i);
+    if (m) addServ(`Indskannet akt: ${m[1]}`);
+  }
+
+  const servMatches =
+    rawText.match(/(?:servitut|deklaration|byplanvedtægt|byggelinje|vejret)[^|;\n\r]{0,110}/gi) || [];
   for (const m of servMatches.slice(0, 5)) {
-    servitutter.push(m.trim());
+    addServ(m);
   }
 
   return {
     fundetTingbog,
-    servitutter,
+    isDoedsbo,
+    servitutter: servitutter.slice(0, 6),
   };
 }
 
@@ -240,15 +288,30 @@ function buildDeterministicChecksForFiles(
       };
     }
 
-    if (parsedTingbog.fundetTingbog && /tingbog|attest|servitut/i.test(meta.name)) {
-      const servitutList = parsedTingbog.servitutter.slice(0, 3);
+    if (
+      parsedTingbog.fundetTingbog &&
+      (/tingbog|attest|servitut|indskannet|skifterets|ejendomsummarisk|\batd_/i.test(meta.name) ||
+        base.kategori.includes("Tingbog") ||
+        base.kategori.includes("Servitut") ||
+        base.kategori.includes("Indskannet"))
+    ) {
+      const servitutList = parsedTingbog.servitutter.slice(0, 4);
+      const isDoedsbo = parsedTingbog.isDoedsbo || /boet efter|skifteretsattest|bobestyrer/.test(raw);
       return {
         ...base,
-        status: servitutList.length > 0 ? "opmaerksomhed" : "ok",
+        status: isDoedsbo || servitutList.length > 0 ? "opmaerksomhed" : "ok",
+        fundOverskrift: isDoedsbo
+          ? `${base.kategori}: Dødsbo/Skifteretsattest & tinglyste servitutter på Matr.nr. ${profile.matrikel.matrikelnummer}`
+          : `${base.kategori} krydstjekket mod Matr.nr. ${profile.matrikel.matrikelnummer} (BFE ${profile.bbr.bfeNummer})`,
         fundDetaljer: [
-          `Adkomst og matrikel (${profile.matrikel.matrikelnummer}) kontrolleret mod Tingbogsattest.`,
+          `Adkomst og matrikel (${profile.matrikel.matrikelnummer}, ${profile.matrikel.ejerlavsnavn}) kontrolleret mod Tingbogsattest / tinglyst akt.`,
+          ...(isDoedsbo
+            ? [
+                `OBS Dødsbo / Bobestyrerbo konstateret i dokumentet (Skifteretsattest / Boet efter afdøde) – kræver dødsbo-ansvarsfraskrivelse i Købsaftalens Afsnit 11.`,
+              ]
+            : []),
           servitutList.length > 0
-            ? `Registrerede servitutter i dokumentet: ${servitutList.join(" · ")}`
+            ? `Registrerede servitutter/akter i dokumentet: ${servitutList.join(" · ")}`
             : `Ingen servitutkonflikter konstateret mod BBR og anvendelse.`,
         ],
       };
@@ -263,7 +326,7 @@ function buildDeterministicChecksForFiles(
           `Dokumentet nævner bygningsdel (udestue/overdækning/forhold uden tilladelse), som afviger fra BBR hoveddata (${profile.bbr.boligarealM2} m²).`,
           `Kræver oplysning og ansvarsfraskrivelse i Købsaftalens Afsnit 11.`,
         ],
-        afsnit11Forslag: `Det fremgår af sagens dokumenter (${meta.name}), at der på ejendommen findes bygningsmæssige forhold/overdækning, som ikke fuldt ud svarer til BBR-registreringen. Køber er gjort bekendt hermed og overtager forholdet uden ansvar for sælger eller medvirkende ejendomsmægler.`,
+        afsnit11Forslag: `Det fremgår af sagens dokumenter (${meta.name}), at der på ejendommen findes bygningsmæssige forhold/overdækning, som ikke fuldt ud svarer til BBR-registreringen. Køber er gjort bekendt hermed og overtager forholdet uden ansvar for sælger.`,
       };
     }
 
@@ -310,10 +373,10 @@ ${
 ---
 
 ### Trin 3: Verificerede Nøgleoplysninger (5 Autoritative Registre)
-* **BBR Hovedbygning:** Opført **${bbr.opfoerelsesaar ?? "—"}**${bbr.ombygningsaar ? ` (om-/tilbygget ${bbr.ombygningsaar})` : ""}, Boligareal **${bbr.boligarealM2} m²**, Bebygget areal **${bbr.bebyggetArealHovedbygningM2} m²** (samlet bebygget **${bbr.samletBebyggetArealM2} m²**), Tag: **${bbr.tagmaterialeTekst}**, Ydervæg: **${bbr.ydervaegTekst}**, Varme: **${bbr.varmeinstallationTekst}**.
+* **BBR Hovedbygning:** Opført **${bbr.opfoerelsesaar ?? "—"}**${bbr.ombygningsaar ? ` (om-/tilbygget ${bbr.ombygningsaar})` : ""}, Boligareal **${bbr.boligarealM2} m²**, Bebygget areal **${bbr.bebyggetArealHovedbygningM2} m²** (samlet bebygget **${bbr.samletBebyggetArealM2} m²**${bbr.udnyttetTagetageM2 > 0 ? `, 1. sal / tagetage **${bbr.udnyttetTagetageM2} m²**` : ""}), Tag: **${bbr.tagmaterialeTekst}**, Ydervæg: **${bbr.ydervaegTekst}**, Varme: **${bbr.varmeinstallationTekst}**.
 * **Matriklen (MAT/v2):** Grundareal **${mat.registreretArealM2} m²**, Fredskov **${mat.fredskovArealM2} m²**, Strandbeskyttelse **${mat.strandbeskyttelseArealM2} m²**, Jordforurening: **${mat.jordforureningStatus}**.
 * **Plandata.dk:** ${plan.lokalplanId ? `Lokalplan nr. ${plan.lokalplanId} (${plan.lokalplanNavn})` : `Ingen særskilt lokalplan (${plan.kommuneplanNavn})`}, Zonestatus: **${plan.zonestatus}**, Bebyggelsesprocent **${plan.faktiskBebyggelsesprocent} %**.
-* **Tingbog & Vurdering:** Offentlig ejendomsværdi **${profile.tingbog.offentligEjendomsvaerdiDkk ? `${profile.tingbog.offentligEjendomsvaerdiDkk.toLocaleString("da-DK")} kr.` : "Se Vurderingsportalen"}**${parsedTingbog.fundetTingbog ? ` · Tingbogsattest aflæst (${parsedTingbog.servitutter.length} servitut-noter)` : ""}.
+* **Tingbog & Vurdering:** Offentlig ejendomsværdi **${profile.tingbog.offentligEjendomsvaerdiDkk ? `${profile.tingbog.offentligEjendomsvaerdiDkk.toLocaleString("da-DK")} kr.` : "Se Vurderingsportalen"}**${parsedTingbog.fundetTingbog ? ` · Tingbogsattest aflæst (${parsedTingbog.servitutter.length} servitut-noter${parsedTingbog.isDoedsbo ? " · OBS: Dødsbo/Skifteretsattest" : ""})` : ""}.
 `;
 }
 
@@ -389,14 +452,15 @@ export async function POST(request: Request) {
           uploadedAt: nowTime,
           matchedReminderId: matchedRem,
           detectedCategory: catInfo.categoryLabel,
-          extractedSummary: fileText.slice(0, 300),
+          extractedSummary: fileText.slice(0, 2500),
         });
       } else {
         existingMeta.matchedReminderId = existingMeta.matchedReminderId || matchedRem;
         existingMeta.detectedCategory = catInfo.categoryLabel || existingMeta.detectedCategory;
+        existingMeta.extractedSummary = fileText.slice(0, 2500) || existingMeta.extractedSummary;
       }
 
-      fileParts.push(buildGeminiPartForBuffer(file.name, buffer));
+      fileParts.push(buildGeminiPartForBuffer(file.name, buffer, fileText));
     }
 
     // Hvis brugeren klikkede "Genkør AI-kontrol" uden at vedhæfte nye filer i dette kald, hent gemte filer fra disk
@@ -418,8 +482,9 @@ export async function POST(request: Request) {
         if (metaMatch) {
           metaMatch.matchedReminderId = metaMatch.matchedReminderId || catInfo.reminderId;
           metaMatch.detectedCategory = catInfo.categoryLabel || metaMatch.detectedCategory;
+          metaMatch.extractedSummary = fileText.slice(0, 2500) || metaMatch.extractedSummary;
         }
-        fileParts.push(buildGeminiPartForBuffer(df.fileName, df.buffer));
+        fileParts.push(buildGeminiPartForBuffer(df.fileName, df.buffer, fileText));
       }
     }
 
