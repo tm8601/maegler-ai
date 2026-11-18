@@ -1,7 +1,13 @@
 import { NextResponse } from "next/server";
-import { upsertSellerCase } from "@/lib/case-store";
+import { authenticateRequestAgent, upsertSellerCase } from "@/lib/case-store";
 
 export async function POST(request: Request) {
+  if (!authenticateRequestAgent(request)) {
+    return NextResponse.json(
+      { error: "Adgang nægtet: API kræver gyldig autentificering." },
+      { status: 401 }
+    );
+  }
   try {
     const body = await request.json();
     const {

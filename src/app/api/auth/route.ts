@@ -1,16 +1,14 @@
 import { NextResponse } from "next/server";
 import {
   authenticateOrRegisterAgent,
+  authenticateRequestAgent,
   listCasesForAgent,
   listPublicAgents,
-  verifyAgentToken,
 } from "@/lib/case-store";
 import { getTenantBudgetState } from "@/lib/ai-cost-guard";
 
 export async function GET(request: Request) {
-  const authHeader = request.headers.get("authorization");
-  const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
-  const user = verifyAgentToken(token);
+  const user = authenticateRequestAgent(request);
   return NextResponse.json({
     user,
     agents: user ? listPublicAgents() : [],

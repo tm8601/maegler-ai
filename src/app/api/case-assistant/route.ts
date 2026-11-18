@@ -8,6 +8,7 @@ import {
   releaseInFlightLock,
 } from "@/lib/ai-cost-guard";
 import {
+  authenticateRequestAgent,
   buildDefaultCheckForMeta,
   computeMissingRemindersForCase,
   detectDocumentCategoryFromContent,
@@ -215,6 +216,12 @@ function buildIntelligentCaseAssistantReply(params: {
 
 
 export async function POST(request: Request) {
+  if (!authenticateRequestAgent(request)) {
+    return NextResponse.json(
+      { error: "Adgang nægtet: API kræver gyldig autentificering." },
+      { status: 401 }
+    );
+  }
   let lockKey = "default";
   try {
     const contentType = request.headers.get("content-type") || "";

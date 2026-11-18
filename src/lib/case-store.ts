@@ -417,15 +417,49 @@ export function authenticateOrRegisterAgent(options: {
 
 export function verifyAgentToken(token?: string | null): AgentUser | null {
   if (!token || !token.includes(".")) return null;
-  const [payloadB64, sig] = token.split(".");
+  const parts = token.split(".");
+  if (parts.length !== 2) return null;
+  const [payloadB64, sig] = parts;
   if (!payloadB64 || !sig) return null;
   const expectedSig = crypto.createHmac("sha256", AUTH_SECRET).update(payloadB64).digest("base64url");
-  if (sig !== expectedSig) return null;
+  const sigBuf = Buffer.from(sig);
+  const expectedBuf = Buffer.from(expectedSig);
+  if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
+    return null;
+  }
   try {
-    return JSON.parse(Buffer.from(payloadB64, "base64url").toString("utf8")) as AgentUser;
+    const parsed = JSON.parse(Buffer.from(payloadB64, "base64url").toString("utf8")) as AgentUser;
+    return parsed && typeof parsed.email === "string" ? parsed : null;
   } catch {
     return null;
   }
+}
+
+export function extractRequestToken(request: Request): string | null {
+  const authHeader = request.headers.get("authorization") || "";
+  if (authHeader.startsWith("Bearer ")) {
+    const token = authHeader.slice(7).trim();
+    if (token) return token;
+  }
+  const cookieHeader = request.headers.get("cookie") || "";
+  for (const part of cookieHeader.split(";")) {
+    const [rawName, ...rest] = part.split("=");
+    if (rawName && rawName.trim() === "maegler_token") {
+      const val = rest.join("=").trim();
+      if (val) {
+        try {
+          return decodeURIComponent(val);
+        } catch {
+          return val;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+export function authenticateRequestAgent(request: Request): AgentUser | null {
+  return verifyAgentToken(extractRequestToken(request));
 }
 
 const globalForCases = globalThis as unknown as {

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
+import { authenticateRequestAgent } from "@/lib/case-store";
 
 const ALLOWED_EXACT = new Set([
   "https://maegler.ai-beregner.dk",
@@ -52,8 +53,6 @@ function isAllowedOrigin(origin: string | null): boolean {
 
 export function proxy(request: NextRequest) {
   const origin = request.headers.get("origin");
-  const referer = request.headers.get("referer");
-  const secFetchSite = request.headers.get("sec-fetch-site");
   const allowed = isAllowedOrigin(origin);
   const corsOrigin = allowed && origin ? origin : "https://maegler.ai-beregner.dk";
 
@@ -78,24 +77,26 @@ export function proxy(request: NextRequest) {
 
   const pathname = request.nextUrl.pathname;
   const isHealthCheck = pathname === "/api/health" || pathname === "/sags-api/health";
+  const isAuthRoute = pathname === "/api/auth" || pathname === "/sags-api/auth";
   const isWatchdogBudget =
     (pathname === "/api/budget" || pathname === "/sags-api/budget") &&
     (request.headers.get("user-agent") || "").includes("Antigravity-Watchdog");
+  const requestedCaseId = request.nextUrl.searchParams.get("id") || "";
+  const isSellerPortalGet =
+    request.method === "GET" &&
+    (pathname === "/api/cases" || pathname === "/sags-api/cases") &&
+    request.nextUrl.searchParams.get("list") !== "1" &&
+    requestedCaseId.length >= 12 &&
+    requestedCaseId !== "default";
+  const isSellerPortalPatch =
+    request.method === "PATCH" &&
+    (pathname === "/api/cases" || pathname === "/sags-api/cases");
 
-  if (!isHealthCheck && !isWatchdogBudget) {
-    const hasAuthCookie = Boolean(request.cookies.get("maegler_token")?.value);
-    const authHeader = request.headers.get("authorization") || "";
-    const hasBearer = authHeader.startsWith("Bearer ") && authHeader.length > 10;
-    const hasCfAccess = Boolean(request.headers.get("cf-access-jwt-assertion"));
-    const isSameOriginBrowser =
-      secFetchSite === "same-origin" ||
-      secFetchSite === "same-site" ||
-      allowed ||
-      isAllowedOrigin(referer);
-
-    if (!hasAuthCookie && !hasBearer && !hasCfAccess && !isSameOriginBrowser) {
+  if (!isHealthCheck && !isAuthRoute && !isWatchdogBudget && !isSellerPortalGet && !isSellerPortalPatch) {
+    const verifiedAgent = authenticateRequestAgent(request);
+    if (!verifiedAgent) {
       return NextResponse.json(
-        { error: "Adgang nægtet: API kræver autentificering." },
+        { error: "Adgang nægtet: API kræver gyldig autentificering." },
         { status: 401 }
       );
     }

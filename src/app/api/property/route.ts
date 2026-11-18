@@ -1,9 +1,15 @@
 import { NextResponse } from "next/server";
 import { fetchFullPropertyProfile } from "@/lib/property-aggregator";
-import { listCasesForAgent, upsertSellerCase } from "@/lib/case-store";
+import { authenticateRequestAgent, listCasesForAgent, upsertSellerCase } from "@/lib/case-store";
 import { getTenantBudgetState } from "@/lib/ai-cost-guard";
 
 export async function GET(request: Request) {
+  if (!authenticateRequestAgent(request)) {
+    return NextResponse.json(
+      { error: "Adgang nægtet: API kræver gyldig autentificering." },
+      { status: 401 }
+    );
+  }
   try {
     const { searchParams } = new URL(request.url);
     const address =

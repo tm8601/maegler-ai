@@ -16,6 +16,7 @@ import {
   setCachedAiAnalysis,
 } from "@/lib/ai-cost-guard";
 import {
+  authenticateRequestAgent,
   buildDefaultCheckForMeta,
   calculateFloorplanVsBbr,
   CaseDocumentCheckItem,
@@ -381,6 +382,12 @@ ${
 }
 
 export async function POST(request: Request) {
+  if (!authenticateRequestAgent(request)) {
+    return NextResponse.json(
+      { error: "Adgang nægtet: API kræver gyldig autentificering." },
+      { status: 401 }
+    );
+  }
   let addressForLock = "default";
   try {
     const formData = await request.formData();

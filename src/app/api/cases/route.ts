@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import {
+  authenticateRequestAgent,
   calculateFloorplanVsBbr,
   deleteCaseById,
   getSellerCase,
@@ -11,39 +12,19 @@ import {
 import { fetchFullPropertyProfile } from "@/lib/property-aggregator";
 import { getTenantBudgetState } from "@/lib/ai-cost-guard";
 
-function isAuthorizedRequest(request: Request): boolean {
-  const cookieHeader = request.headers.get("cookie") || "";
-  const hasAuthCookie = cookieHeader.includes("maegler_token=");
-  const authHeader = request.headers.get("authorization") || "";
-  const hasBearer = authHeader.startsWith("Bearer ") && authHeader.length > 10;
-  const hasCfAccess = Boolean(request.headers.get("cf-access-jwt-assertion"));
-  const secFetchSite = request.headers.get("sec-fetch-site");
-  const origin = request.headers.get("origin") || "";
-  const referer = request.headers.get("referer") || "";
-  const isSameOriginBrowser =
-    secFetchSite === "same-origin" ||
-    secFetchSite === "same-site" ||
-    origin.includes("ai-beregner.dk") ||
-    origin.includes("localhost") ||
-    referer.includes("ai-beregner.dk") ||
-    referer.includes("localhost");
-
-  return hasAuthCookie || hasBearer || hasCfAccess || isSameOriginBrowser;
-}
-
 export async function GET(request: Request) {
-  if (!isAuthorizedRequest(request)) {
-    return NextResponse.json(
-      { error: "Adgang nægtet: API kræver autentificering." },
-      { status: 401 }
-    );
-  }
-
+  const agent = authenticateRequestAgent(request);
   const { searchParams } = new URL(request.url);
   const listMode = searchParams.get("list") === "1";
   const agentEmail = searchParams.get("agentEmail") || undefined;
 
   if (listMode) {
+    if (!agent) {
+      return NextResponse.json(
+        { error: "Adgang nægtet: API kræver gyldig autentificering." },
+        { status: 401 }
+      );
+    }
     const cases = listCasesForAgent(agentEmail).map(({ profileSnapshot: _, ...summary }) => summary);
     return NextResponse.json({
       cases,
@@ -51,12 +32,36 @@ export async function GET(request: Request) {
     });
   }
 
-  const id = searchParams.get("id") || "default";
-  const reopen = searchParams.get("reopen") === "1";
-  const existsInStore = hasSellerCase(id);
-  let record = getSellerCase(id);
+  const id = searchParams.get("id") || "";
+  const existsInStore = Boolean(id && id !== "default" && hasSellerCase(id));
 
-  if (reopen && existsInStore) {
+  // Uautentificeret sælgerportal: kun adgang til specifik eksisterende sag uden interne mægler- eller agentliste-data
+  if (!agent) {
+    if (!existsInStore || id.length < 12) {
+      return NextResponse.json(
+        { error: "Adgang nægtet: API kræver gyldig autentificering." },
+        { status: 401 }
+      );
+    }
+    const record = getSellerCase(id);
+    return NextResponse.json({
+      id: record.id,
+      address: record.address,
+      sellerName: record.sellerName,
+      skipSellerQuestionnaire: record.skipSellerQuestionnaire,
+      dynamicQuestions: record.dynamicQuestions,
+      disabledQuestionIds: record.disabledQuestionIds,
+      answers: record.answers,
+      followUpNotes: record.followUpNotes,
+      generatedAfsnit11Clauses: record.generatedAfsnit11Clauses,
+    });
+  }
+
+  const targetId = id || "default";
+  const reopen = searchParams.get("reopen") === "1";
+  let record = getSellerCase(targetId);
+
+  if (reopen && hasSellerCase(targetId)) {
     let profile = record.profileSnapshot;
     if (!profile && record.address) {
       try {
@@ -90,6 +95,12 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
+  if (!authenticateRequestAgent(request)) {
+    return NextResponse.json(
+      { error: "Adgang nægtet: API kræver gyldig autentificering." },
+      { status: 401 }
+    );
+  }
   try {
     const body = await request.json();
     let floorplanCheck = body.floorplanCheck;
@@ -151,11 +162,16 @@ export async function PATCH(request: Request) {
   try {
     const body = await request.json();
     const { id, answers, followUpNotes } = body;
-    if (!id) {
-      return NextResponse.json({ error: "Mangler sags-ID" }, { status: 400 });
+    if (!id || typeof id !== "string" || id === "default" || !hasSellerCase(id)) {
+      return NextResponse.json({ error: "Ugyldigt eller ukendt sags-ID" }, { status: 404 });
     }
     const updated = saveSellerCaseAnswers(id, answers || {}, followUpNotes || {});
-    return NextResponse.json(updated);
+    return NextResponse.json({
+      id: updated.id,
+      answers: updated.answers,
+      followUpNotes: updated.followUpNotes,
+      generatedAfsnit11Clauses: updated.generatedAfsnit11Clauses,
+    });
   } catch (error: any) {
     return NextResponse.json(
       { error: error.message || "Kunne ikke gemme sælgersvar" },
@@ -165,6 +181,12 @@ export async function PATCH(request: Request) {
 }
 
 export async function DELETE(request: Request) {
+  if (!authenticateRequestAgent(request)) {
+    return NextResponse.json(
+      { error: "Adgang nægtet: API kræver gyldig autentificering." },
+      { status: 401 }
+    );
+  }
   const { searchParams } = new URL(request.url);
   const id = searchParams.get("id");
   if (!id) {
