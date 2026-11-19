@@ -10,7 +10,35 @@ const DATA_DIR = resolvePersistentDataDir();
 const CASES_FILE = path.join(DATA_DIR, "maegler-cases-v2.json");
 const AGENTS_FILE = path.join(DATA_DIR, "maegler-agents.json");
 const UPLOADS_DIR = path.join(DATA_DIR, "uploads");
-const AUTH_SECRET = process.env.AUTH_SECRET || "vejle-maegleren-2026-secret-key";
+
+let cachedRuntimeAuthSecret: string | null = null;
+
+function getAuthSecret(): string {
+  if (cachedRuntimeAuthSecret) return cachedRuntimeAuthSecret;
+  const envSecret = (process.env.AUTH_SECRET || "").trim();
+  if (envSecret) {
+    cachedRuntimeAuthSecret = envSecret;
+    return cachedRuntimeAuthSecret;
+  }
+  const secretFile = path.join(DATA_DIR, ".auth-secret");
+  try {
+    if (fs.existsSync(secretFile)) {
+      const stored = fs.readFileSync(secretFile, "utf8").trim();
+      if (stored.length >= 32) {
+        cachedRuntimeAuthSecret = stored;
+        return cachedRuntimeAuthSecret;
+      }
+    }
+    ensureDataDir();
+    const generated = crypto.randomBytes(32).toString("hex");
+    fs.writeFileSync(secretFile, generated, { encoding: "utf8", mode: 0o600 });
+    cachedRuntimeAuthSecret = generated;
+    return cachedRuntimeAuthSecret;
+  } catch {
+    cachedRuntimeAuthSecret = crypto.randomBytes(32).toString("hex");
+    return cachedRuntimeAuthSecret;
+  }
+}
 
 export interface AgentUser {
   id: string;
@@ -411,7 +439,7 @@ export function authenticateOrRegisterAgent(options: {
 
   const { passwordHash: _, ...publicUser } = stored;
   const payloadB64 = Buffer.from(JSON.stringify(publicUser), "utf8").toString("base64url");
-  const sig = crypto.createHmac("sha256", AUTH_SECRET).update(payloadB64).digest("base64url");
+  const sig = crypto.createHmac("sha256", getAuthSecret()).update(payloadB64).digest("base64url");
   return { user: publicUser, token: `${payloadB64}.${sig}` };
 }
 
@@ -421,7 +449,7 @@ export function verifyAgentToken(token?: string | null): AgentUser | null {
   if (parts.length !== 2) return null;
   const [payloadB64, sig] = parts;
   if (!payloadB64 || !sig) return null;
-  const expectedSig = crypto.createHmac("sha256", AUTH_SECRET).update(payloadB64).digest("base64url");
+  const expectedSig = crypto.createHmac("sha256", getAuthSecret()).update(payloadB64).digest("base64url");
   const sigBuf = Buffer.from(sig);
   const expectedBuf = Buffer.from(expectedSig);
   if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
