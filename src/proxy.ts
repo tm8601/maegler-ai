@@ -92,6 +92,30 @@ export function proxy(request: NextRequest) {
     request.method === "PATCH" &&
     (pathname === "/api/cases" || pathname === "/sags-api/cases");
 
+  const clientIp =
+    request.headers.get("cf-connecting-ip") ||
+    request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
+    "unknown";
+
+  if (isWatchdogBudget && !checkRateLimit(clientIp, "budget", 30, 60_000)) {
+    return NextResponse.json(
+      { error: "Rate limit overskredet for /api/budget." },
+      { status: 429 }
+    );
+  }
+  if (isSellerPortalGet && !checkRateLimit(clientIp, "seller_get", 60, 60_000)) {
+    return NextResponse.json(
+      { error: "For mange forespørgsler til sælgerportal." },
+      { status: 429 }
+    );
+  }
+  if (isSellerPortalPatch && !checkRateLimit(clientIp, "seller_patch", 20, 60_000)) {
+    return NextResponse.json(
+      { error: "For mange opdateringer til sælgerportal. Vent venligst et minut." },
+      { status: 429 }
+    );
+  }
+
   if (!isHealthCheck && !isAuthRoute && !isWatchdogBudget && !isSellerPortalGet && !isSellerPortalPatch) {
     const verifiedAgent = authenticateRequestAgent(request);
     if (!verifiedAgent) {
@@ -100,11 +124,6 @@ export function proxy(request: NextRequest) {
         { status: 401 }
       );
     }
-
-    const clientIp =
-      request.headers.get("cf-connecting-ip") ||
-      request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
-      "unknown";
 
     if (pathname.includes("/mail") && !checkRateLimit(clientIp, "mail", 10, 60_000)) {
       return NextResponse.json(
