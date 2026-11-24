@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 import zlib from "zlib";
-import { resolvePersistentDataDir } from "@/lib/ai-cost-guard";
+import { resolvePersistentDataDir } from "./ai-cost-guard";
 
 const DATA_DIR = resolvePersistentDataDir();
 const LEARNING_MEMORY_FILE = path.join(DATA_DIR, "doc-renamer-memory.json");
@@ -614,33 +614,36 @@ function matchLearnedMemoryRule(
 
   for (const rule of memory.learnedRules) {
     let score = 0;
+    let contentHits = 0;
 
-    // 1. Filnavns-token overlap
+    // 1. Filnavns-token overlap (bonus op til 30 point)
     if (rule.filenameTokens.length > 0 && sig.filenameTokens.length > 0) {
       const fnMatches = rule.filenameTokens.filter((t) => sig.filenameTokens.includes(t)).length;
-      score += (fnMatches / rule.filenameTokens.length) * 45;
+      score += (fnMatches / Math.min(rule.filenameTokens.length, 4)) * 30;
     }
 
-    // 2. Header-frase overlap
+    // 2. Header-frase overlap (op til 55 point)
     if (rule.headerPhrases.length > 0) {
       const phraseMatches = rule.headerPhrases.filter((p) => lowerText.includes(p)).length;
-      score += (phraseMatches / rule.headerPhrases.length) * 45;
+      contentHits += phraseMatches;
+      score += Math.min(55, (phraseMatches / Math.min(rule.headerPhrases.length, 5)) * 55);
     }
 
-    // 3. Signatur-keyword overlap
-    if (rule.signatureKeywords.length > 0 && sig.signatureKeywords.length > 0) {
+    // 3. Signatur-keyword overlap (op til 55 point)
+    if (rule.signatureKeywords.length > 0) {
       const kwSet = new Set(sig.signatureKeywords);
       const kwMatches = rule.signatureKeywords.filter((k) => kwSet.has(k) || lowerText.includes(k)).length;
-      score += (kwMatches / rule.signatureKeywords.length) * 40;
+      contentHits += kwMatches;
+      score += Math.min(55, (kwMatches / Math.min(rule.signatureKeywords.length, 7)) * 55);
     }
 
-    if (score > bestScore) {
+    if (contentHits >= 2 && score > bestScore) {
       bestScore = score;
       bestRule = rule;
     }
   }
 
-  if (bestRule && bestScore >= 52) {
+  if (bestRule && bestScore >= 48) {
     return { rule: bestRule, score: Math.min(99, Math.round(bestScore)) };
   }
   return null;
