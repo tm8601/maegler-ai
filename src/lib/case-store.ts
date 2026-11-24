@@ -5,6 +5,11 @@ import zlib from "zlib";
 import { Question, standardSellerQuestions } from "@/data/seller-questions";
 import type { PropertyFullProfile, RenovationLevelKey } from "@/lib/property-aggregator";
 import { resolvePersistentDataDir } from "@/lib/ai-cost-guard";
+import {
+  computeRenamedDocumentsPlan,
+  extractLocalPdfText,
+  RenameRecognitionMethod,
+} from "@/lib/document-renamer";
 
 const DATA_DIR = resolvePersistentDataDir();
 const CASES_FILE = path.join(DATA_DIR, "maegler-cases-v2.json");
@@ -64,6 +69,14 @@ export interface CaseUploadedDocMeta {
   detectedCategory?: string;
   extractedSummary?: string;
   checkStatus?: "ok" | "opmaerksomhed" | "afvigelse";
+  renamedFileName?: string;
+  renamedBaseName?: string;
+  renameStatusBadge?: string;
+  renameMethod?: RenameRecognitionMethod;
+  fiveYearPremiumDkk?: number | null;
+  assessmentYear?: string | null;
+  isManualRename?: boolean;
+  ejerskifteSwapRank?: number | null;
 }
 
 export interface CaseDocumentCheckItem {
@@ -782,6 +795,38 @@ export function detectDocumentCategoryFromContent(
   };
 }
 
+export function applyAutomaticDocumentRenaming(metas: CaseUploadedDocMeta[]): CaseUploadedDocMeta[] {
+  if (!metas || metas.length === 0) return [];
+  const docInputs = metas
+    .filter((m) => m.type === "document" || /\.pdf$/i.test(m.name))
+    .map((m) => ({
+      id: m.id,
+      originalName: m.name,
+      extractedText: m.extractedSummary || "",
+      manualTargetName: m.isManualRename ? m.renamedBaseName || m.renamedFileName || null : null,
+      isManualOverride: Boolean(m.isManualRename),
+      ejerskifteSwapRank: m.ejerskifteSwapRank ?? null,
+    }));
+
+  const plan = computeRenamedDocumentsPlan(docInputs);
+  const planById = new Map(plan.map((p) => [p.id, p]));
+
+  return metas.map((m) => {
+    const p = planById.get(m.id);
+    if (!p) return m;
+    return {
+      ...m,
+      renamedFileName: p.targetFileName,
+      renamedBaseName: p.targetBaseName,
+      renameStatusBadge: p.statusBadge,
+      renameMethod: p.recognitionMethod,
+      fiveYearPremiumDkk: p.fiveYearPremiumDkk ?? m.fiveYearPremiumDkk ?? null,
+      assessmentYear: p.assessmentYear ?? m.assessmentYear ?? null,
+      detectedCategory: p.targetBaseName || m.detectedCategory,
+    };
+  });
+}
+
 export function detectReminderMatchFromFilename(fileName: string, extraContent = ""): string | null {
   return detectDocumentCategoryFromContent(fileName, extraContent).reminderId;
 }
@@ -1189,7 +1234,9 @@ export function upsertSellerCase(input: {
     }
   }
 
-  const uploadedDocMeta = input.uploadedDocMeta ?? existing?.uploadedDocMeta ?? [];
+  const uploadedDocMeta = applyAutomaticDocumentRenaming(
+    input.uploadedDocMeta ?? existing?.uploadedDocMeta ?? []
+  );
 
   // Sørg for at alle uploadede filer altid har et synligt dokument-/billedtjek
   let documentChecks = input.documentChecks ?? existing?.documentChecks ?? [];
@@ -1318,6 +1365,7 @@ export function getSellerCase(id: string): SellerCaseRecord {
   const cases = loadCases();
   if (cases[id]) {
     const c = cases[id];
+    c.uploadedDocMeta = applyAutomaticDocumentRenaming(c.uploadedDocMeta || []);
     if (!c.documentChecks) {
       c.documentChecks = (c.uploadedDocMeta || []).map((m) =>
         buildDefaultCheckForMeta(m, c.profileSnapshot)

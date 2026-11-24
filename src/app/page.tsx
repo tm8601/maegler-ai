@@ -64,6 +64,51 @@ interface DawaSuggestion {
   };
 }
 
+const DEFAULT_STANDARD_DOC_NAMES: string[] = [
+  "BBR-Meddelelse",
+  "Boligskattelån",
+  "Boligskattelån, kvittering",
+  "Brændeovn oplysninger",
+  "Byggesag 1",
+  "Byggesag 2",
+  "Byggesag 3",
+  "Byggesag 4",
+  "Byggesag 5",
+  "Deklaration ejendomsvurdering",
+  "Ejendomsbidragsbillet",
+  "Ejendomsdatarapport",
+  "Ejendomsdatarapport – resumé",
+  "Ejendomskort",
+  "Ejendomsskattebillet",
+  "Ejendomsskatter – indefrosne, kvittering",
+  "Ejendomsvurdering 2022",
+  "Ejendomsvurdering 2023",
+  "Ejendomsvurdering 2024",
+  "Ejerskifteforsikring, tilbud",
+  "Ejerskifteforsikring, alternativt tilbud",
+  "Elinstallationsrapport",
+  "Energimærke",
+  "Fbb bevaringsværdighed",
+  "Foreløbig vurdering",
+  "Jordforureningsattest",
+  "Kommuneplan",
+  "Kort over vejforsyning",
+  "Police husforsikring",
+  "Restgældskvittering",
+  "Råstofplanskort",
+  "Servitut 1",
+  "Servitut 2",
+  "Servitut 3",
+  "Servitut 4",
+  "Servitut 5",
+  "Sælgeransvarsforsikring, tilbud",
+  "Sælgers oplysninger om tidligere opvarmning",
+  "Sælgers tilbud om betaling af halv ejerskifteforsikring",
+  "Tilstandsrapport, gældende",
+  "Tingbogsattest",
+  "Varmeopgørelse",
+];
+
 interface UploadedDocItem {
   id: string;
   file?: File;
@@ -74,6 +119,13 @@ interface UploadedDocItem {
   objectUrl?: string;
   matchedReminderId?: string | null;
   detectedCategory?: string;
+  renamedFileName?: string;
+  renamedBaseName?: string;
+  renameStatusBadge?: string;
+  renameMethod?: string;
+  fiveYearPremiumDkk?: number | null;
+  assessmentYear?: string | null;
+  isManualRename?: boolean;
 }
 
 type SkraafotoOrientation = "south" | "west" | "north" | "east";
@@ -163,6 +215,13 @@ export default function Home() {
   const [isDraggingOver, setIsDraggingOver] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisResult, setAnalysisResult] = useState<string | null>(null);
+  const [standardDocNames, setStandardDocNames] = useState<string[]>(DEFAULT_STANDARD_DOC_NAMES);
+  const [renameDrafts, setRenameDrafts] = useState<Record<string, string>>({});
+  const [savingRenameDocId, setSavingRenameDocId] = useState<string | null>(null);
+  const [justLearnedDocId, setJustLearnedDocId] = useState<string | null>(null);
+  const [newCustomStandardName, setNewCustomStandardName] = useState<string>("");
+  const [learnedRulesCount, setLearnedRulesCount] = useState<number>(0);
+  const [isDownloadingZip, setIsDownloadingZip] = useState<boolean>(false);
 
   // Plantegnings- & Arealberegner state (LxB med 10 cm indervæg & 35 cm ydervæg mod BBR ±15 %)
   const [fpLengthM, setFpLengthM] = useState<string>("10.4");
@@ -306,6 +365,13 @@ export default function Home() {
             objectUrl: existingLocal.objectUrl || serverUrl,
             matchedReminderId: meta.matchedReminderId,
             detectedCategory: meta.detectedCategory || existingLocal.detectedCategory,
+            renamedFileName: meta.renamedFileName,
+            renamedBaseName: meta.renamedBaseName,
+            renameStatusBadge: meta.renameStatusBadge,
+            renameMethod: meta.renameMethod,
+            fiveYearPremiumDkk: meta.fiveYearPremiumDkk,
+            assessmentYear: meta.assessmentYear,
+            isManualRename: meta.isManualRename,
           });
         } else {
           merged.push({
@@ -317,11 +383,23 @@ export default function Home() {
             objectUrl: serverUrl,
             matchedReminderId: meta.matchedReminderId,
             detectedCategory: meta.detectedCategory,
+            renamedFileName: meta.renamedFileName,
+            renamedBaseName: meta.renamedBaseName,
+            renameStatusBadge: meta.renameStatusBadge,
+            renameMethod: meta.renameMethod,
+            fiveYearPremiumDkk: meta.fiveYearPremiumDkk,
+            assessmentYear: meta.assessmentYear,
+            isManualRename: meta.isManualRename,
           });
         }
       }
       return merged;
     });
+    const nextDrafts: Record<string, string> = {};
+    for (const meta of record.uploadedDocMeta || []) {
+      nextDrafts[meta.id] = meta.renamedBaseName || meta.detectedCategory || meta.name.replace(/\.pdf$/i, "");
+    }
+    setRenameDrafts(nextDrafts);
   };
 
   const loadPropertyProfile = async (
@@ -1025,6 +1103,138 @@ export default function Home() {
         const savedRecord: SellerCaseRecord = await saveRes.json();
         setActiveCase(savedRecord);
       }
+    }
+  };
+
+  // Hent standard-dokumentnavne og selvlærende hukommelse ved opstart
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    fetch(`${getApiBaseUrl()}/sags-api/doc-renamer`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (d && Array.isArray(d.standardNames) && d.standardNames.length > 0) {
+          setStandardDocNames(d.standardNames);
+        }
+        if (d && d.memory && Array.isArray(d.memory.learnedRules)) {
+          setLearnedRulesCount(d.memory.learnedRules.length);
+        }
+      })
+      .catch(() => {
+        // Ignore
+      });
+  }, [isAuthenticated]);
+
+  const handleRenameAndLearn = async (docId: string, overrideName?: string) => {
+    const targetCaseId = activeCase?.id || caseId;
+    const rawTarget = (overrideName ?? renameDrafts[docId] ?? "").trim();
+    if (!targetCaseId || !rawTarget) return;
+
+    setSavingRenameDocId(docId);
+    try {
+      const res = await fetch(`${getApiBaseUrl()}/sags-api/doc-renamer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "rename_and_learn",
+          caseId: targetCaseId,
+          docId,
+          newTargetName: rawTarget,
+          addToStandardList: true,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.sellerCase) {
+          syncCaseToState(data.sellerCase, profile || undefined);
+        }
+        if (Array.isArray(data.standardNames)) {
+          setStandardDocNames(data.standardNames);
+        }
+        if (data.memory && Array.isArray(data.memory.learnedRules)) {
+          setLearnedRulesCount(data.memory.learnedRules.length);
+        }
+        setJustLearnedDocId(docId);
+        setTimeout(() => setJustLearnedDocId((prev) => (prev === docId ? null : prev)), 2500);
+      }
+    } catch (err) {
+      console.error("Kunne ikke gemme og lære filnavn:", err);
+    } finally {
+      setSavingRenameDocId(null);
+    }
+  };
+
+  const handleSwapEjerskifteOffers = async () => {
+    const targetCaseId = activeCase?.id || caseId;
+    if (!targetCaseId) return;
+    try {
+      const res = await fetch(`${getApiBaseUrl()}/sags-api/doc-renamer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "swap_ejerskifte",
+          caseId: targetCaseId,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.sellerCase) {
+          syncCaseToState(data.sellerCase, profile || undefined);
+        }
+      }
+    } catch (err) {
+      console.error("Kunne ikke bytte ejerskifteforsikring-tilbud:", err);
+    }
+  };
+
+  const handleAddCustomStandardName = async () => {
+    const raw = newCustomStandardName.trim();
+    if (!raw) return;
+    try {
+      const res = await fetch(`${getApiBaseUrl()}/sags-api/doc-renamer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "add_standard_name",
+          newStandardName: raw,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.standardNames)) {
+          setStandardDocNames(data.standardNames);
+        }
+        setNewCustomStandardName("");
+      }
+    } catch (err) {
+      console.error("Kunne ikke tilføje nyt standardnavn:", err);
+    }
+  };
+
+  const handleDownloadRenamedZip = async () => {
+    const targetCaseId = activeCase?.id || caseId;
+    if (!targetCaseId || uploadedDocs.length === 0) return;
+    setIsDownloadingZip(true);
+    try {
+      const zipUrl = `${getApiBaseUrl()}/sags-api/doc-renamer?caseId=${encodeURIComponent(
+        targetCaseId
+      )}&action=zip`;
+      const res = await fetch(zipUrl);
+      if (res.ok) {
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        const cleanAddr = (profile?.adresse || address).replace(/[^a-zA-Z0-9æøåÆØÅ ,.-]/g, "").trim();
+        a.download = `Dokumenter - ${cleanAddr}.zip`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      }
+    } catch (err) {
+      console.error("Fejl ved download af ZIP:", err);
+    } finally {
+      setIsDownloadingZip(false);
     }
   };
 
@@ -2527,7 +2737,7 @@ Tlf.: ${currentAgent.phone} · ${currentAgent.email}`;
         )}
 
         {/* =====================================================================
-            FANE 2: DOKUMENTRUM – KOMPAKT, LETLÆSELIGT & AUTOMATISK INDHOLDSGENKENDELSE
+            FANE 2: DOKUMENTRUM – 100 % GRATIS FIL-OMDØBNING, SELVLÆRENDE MOTOR & ZIP-EKSPORT
            ===================================================================== */}
         {selectedAddress && profile && activeTab === "dokumentrum" && (
           <section
@@ -2547,13 +2757,22 @@ Tlf.: ${currentAgent.phone} · ${currentAgent.email}`;
               isDraggingOver ? "ring-2 ring-blue-500" : ""
             }`}
           >
-            <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-slate-100">
+            <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-100">
               <div>
-                <h2 className="text-sm font-bold text-slate-900">
-                  Kompakt Dokumentrum · Automatisk Indholdsgenkendelse (uanset filnavn)
-                </h2>
-                <p className="text-[11px] text-slate-500">
-                  Systemet læser indholdet i alle uploadede PDF&apos;er og fotos (op til 5,00 kr. AI-budget pr. sag) og kategoriserer dem automatisk
+                <div className="flex flex-wrap items-center gap-2">
+                  <h2 className="text-sm font-bold text-slate-900">
+                    Automatisk Dokumentrum · Fil-omdøbning & ZIP-eksport
+                  </h2>
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-[10px] font-bold text-emerald-800">
+                    <CheckCircle2 size={11} />
+                    <span>100 % uden betalt AI (0,00 kr.)</span>
+                  </span>
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-blue-50 border border-blue-200 text-[10px] font-semibold text-blue-800">
+                    <span>Selvlærende hukommelse: {learnedRulesCount} tillærte regler</span>
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  Scanner PDF-indhold lokalt, omdøber til faste standard-filnavne (uden datoer), sammenligner 5-årig præmie på ejerskifteforsikring og bevarer nummererede servitutter/byggesager
                 </p>
               </div>
               <div className="flex flex-wrap items-center gap-2">
@@ -2561,30 +2780,41 @@ Tlf.: ${currentAgent.phone} · ${currentAgent.email}`;
                   type="button"
                   onClick={() => docInputRef.current?.click()}
                   disabled={isAnalyzing}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold cursor-pointer"
+                  className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold cursor-pointer shadow-2xs"
                 >
                   <Upload size={13} />
-                  <span>{isAnalyzing ? "Læser indhold..." : "+ Upload dokumenter / fotos"}</span>
+                  <span>{isAnalyzing ? "Scanner PDF-indhold..." : "+ Upload dokumenter / PDF'er"}</span>
                 </button>
-                {uploadedDocs.length > 0 && (
-                  <button
-                    type="button"
-                    onClick={() => runAnalysis(uploadedDocs.filter((d) => d.file).map((d) => d.file!))}
-                    disabled={isAnalyzing}
-                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold cursor-pointer"
-                  >
-                    <RefreshCw size={12} className={isAnalyzing ? "animate-spin" : ""} />
-                    <span>Gen-analyser</span>
-                  </button>
-                )}
+
                 <button
                   type="button"
-                  onClick={handleDownloadAllDocuments}
-                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold cursor-pointer"
+                  onClick={handleDownloadRenamedZip}
+                  disabled={uploadedDocs.length === 0 || isDownloadingZip}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-45 text-white text-xs font-bold cursor-pointer shadow-2xs"
                 >
-                  <Download size={12} />
-                  <span>Hent alle</span>
+                  <Download size={14} />
+                  <span>
+                    {isDownloadingZip
+                      ? "Pakker ZIP..."
+                      : `Download ZIP med alle omdøbte filer (${uploadedDocs.length})`}
+                  </span>
                 </button>
+
+                {uploadedDocs.filter(
+                  (d) =>
+                    (d.renamedBaseName || "").toLowerCase().startsWith("ejerskifteforsikring") ||
+                    (d.detectedCategory || "").toLowerCase().startsWith("ejerskifteforsikring")
+                ).length >= 2 && (
+                  <button
+                    type="button"
+                    onClick={handleSwapEjerskifteOffers}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300 text-xs font-semibold cursor-pointer"
+                    title="Byt rundt på hovedtilbud og alternativt tilbud på ejerskifteforsikring"
+                  >
+                    <RefreshCw size={12} />
+                    <span>⇄ Byt Ejerskifteforsikring (Tilbud ↔ Alternativt)</span>
+                  </button>
+                )}
               </div>
             </div>
 
@@ -2592,21 +2822,291 @@ Tlf.: ${currentAgent.phone} · ${currentAgent.email}`;
               <div className="p-3 rounded-xl bg-blue-50 border border-blue-200 text-blue-900 text-xs flex items-center gap-2.5 animate-pulse">
                 <RefreshCw size={15} className="animate-spin text-blue-600 flex-shrink-0" />
                 <span>
-                  Læser indholdet af uploadede dokumenter og fotos og krydstjekker mod BBR ({profile.bbr.boligarealM2} m²), Olietank-regler og Afsnit 11...
+                  Scanner PDF-indhold lokalt (0,00 kr.), udtrækker vurderingsår og 5-årig præmie på ejerskifteforsikring og omdøber til standard-filnavne...
                 </span>
               </div>
             )}
 
-            {/* 1. KOMPAKT STATUS PÅ SAGENS 4 KERNEDOKUMENT-KRAV */}
+            {/* 1. OVERSIGTSTABEL: OPRINDELIGT FILNAVN -> NYT AUTOMATISK FILNAVN + STATUS + GEM & LÆR */}
+            <div className="space-y-2.5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h3 className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
+                  1. Fil-omdøbning & Selvlærende Dokumentrum ({uploadedDocs.length} dokumenter)
+                </h3>
+
+                {/* Tilføj nyt fast dokumentnavn til standardlisten */}
+                <div className="flex items-center gap-1.5">
+                  <label htmlFor="new-custom-standard-name" className="text-[11px] text-slate-600 font-medium">
+                    Nyt standardnavn:
+                  </label>
+                  <input
+                    id="new-custom-standard-name"
+                    name="new-custom-standard-name"
+                    type="text"
+                    autoCorrect="off"
+                    autoCapitalize="none"
+                    spellCheck={false}
+                    enterKeyHint="done"
+                    value={newCustomStandardName}
+                    onChange={(e) => setNewCustomStandardName(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.nativeEvent.isComposing && e.keyCode !== 229) {
+                        e.preventDefault();
+                        handleAddCustomStandardName();
+                      }
+                    }}
+                    placeholder="F.eks. Deklaration kloaklav..."
+                    className="border border-slate-300 rounded-lg px-2.5 py-1 text-xs bg-slate-50 focus:bg-white focus:border-slate-900 outline-none text-slate-900 w-44 sm:w-52"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleAddCustomStandardName}
+                    disabled={!newCustomStandardName.trim()}
+                    className="px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 disabled:opacity-40 text-white text-[11px] font-semibold cursor-pointer"
+                  >
+                    + Tilføj til liste
+                  </button>
+                </div>
+              </div>
+
+              <datalist id="standard-doc-names-datalist">
+                {standardDocNames.map((stdName) => (
+                  <option key={stdName} value={stdName} />
+                ))}
+              </datalist>
+
+              {uploadedDocs.length > 0 ? (
+                <div
+                  tabIndex={0}
+                  role="region"
+                  aria-labelledby="doc-rename-table-caption"
+                  className="overflow-x-auto border border-slate-200 rounded-xl shadow-2xs"
+                >
+                  <table className="w-full text-left border-collapse text-xs">
+                    <caption id="doc-rename-table-caption" className="sr-only">
+                      Oversigt over automatisk omdøbte ejendomsdokumenter i dokumentrummet
+                    </caption>
+                    <thead className="bg-slate-50 border-b border-slate-200 text-[11px] font-bold text-slate-600 uppercase tracking-wider">
+                      <tr>
+                        <th scope="col" className="py-2.5 px-3">
+                          Oprindeligt filnavn
+                        </th>
+                        <th scope="col" className="py-2.5 px-3">
+                          Nyt automatisk filnavn
+                        </th>
+                        <th scope="col" className="py-2.5 px-3">
+                          Status / Sikkerhed &amp; Præmie
+                        </th>
+                        <th scope="col" className="py-2.5 px-3">
+                          Ret navn &amp; Selvlærende motor
+                        </th>
+                        <th scope="col" className="py-2.5 px-3 text-right">
+                          Handling
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 bg-white">
+                      {uploadedDocs.map((doc) => {
+                        const check = documentChecks.find((c) => c.fileName === doc.name);
+                        const finalFileName =
+                          doc.renamedFileName ||
+                          `${doc.renamedBaseName || doc.detectedCategory || doc.name.replace(/\.pdf$/i, "")}.pdf`;
+                        const statusText =
+                          doc.renameStatusBadge ||
+                          (doc.isManualRename ? "Manuelt navngivet (Gemt & tillært)" : "Genkendt automatisk");
+                        const draftVal =
+                          renameDrafts[doc.id] ??
+                          doc.renamedBaseName ??
+                          doc.detectedCategory ??
+                          doc.name.replace(/\.pdf$/i, "");
+
+                        const isPreserved = doc.renameMethod === "preserved_user_number";
+                        const isCheapestEjerskifte = doc.renameMethod === "ejerskifte_cheapest_5yr";
+                        const isExpensiveEjerskifte = doc.renameMethod === "ejerskifte_expensive_5yr";
+                        const isLearned = doc.renameMethod === "learned_memory" || doc.isManualRename;
+
+                        return (
+                          <tr key={doc.id} className="hover:bg-slate-50/80 transition-colors">
+                            <th
+                              scope="row"
+                              className="py-2.5 px-3 font-medium text-slate-600 max-w-[210px] truncate"
+                              title={doc.name}
+                            >
+                              <div className="truncate">{doc.name}</div>
+                              <span className="text-[10px] text-slate-400 font-normal">
+                                {doc.sizeKb} KB
+                              </span>
+                            </th>
+
+                            <td className="py-2.5 px-3">
+                              <div className="flex items-center gap-1.5">
+                                <span className="text-slate-400 font-bold" aria-hidden="true">
+                                  →
+                                </span>
+                                <span className="font-bold text-slate-900 bg-emerald-50/80 border border-emerald-200 px-2 py-1 rounded-lg">
+                                  {finalFileName}
+                                </span>
+                              </div>
+                            </td>
+
+                            <td className="py-2.5 px-3">
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                <span
+                                  className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold border ${
+                                    isCheapestEjerskifte
+                                      ? "bg-emerald-100 text-emerald-900 border-emerald-300"
+                                      : isExpensiveEjerskifte
+                                      ? "bg-amber-100 text-amber-900 border-amber-300"
+                                      : isPreserved
+                                      ? "bg-purple-50 text-purple-900 border-purple-200"
+                                      : isLearned
+                                      ? "bg-blue-100 text-blue-900 border-blue-300"
+                                      : "bg-slate-100 text-slate-800 border-slate-200"
+                                  }`}
+                                >
+                                  {statusText}
+                                </span>
+                                {typeof doc.fiveYearPremiumDkk === "number" && (
+                                  <span className="inline-flex items-center px-2 py-0.5 rounded-md bg-emerald-50 text-emerald-800 border border-emerald-200 text-[10px] font-bold">
+                                    5-årig præmie: {doc.fiveYearPremiumDkk.toLocaleString("da-DK")} kr.
+                                  </span>
+                                )}
+                                {justLearnedDocId === doc.id && (
+                                  <span
+                                    role="status"
+                                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-600 text-white text-[10px] font-bold"
+                                  >
+                                    <Check size={10} /> Gemt &amp; tillært!
+                                  </span>
+                                )}
+                              </div>
+                            </td>
+
+                            <td className="py-2.5 px-3">
+                              <div className="flex flex-wrap sm:flex-nowrap items-center gap-1.5">
+                                <label htmlFor={`select-std-${doc.id}`} className="sr-only">
+                                  Vælg standardnavn for {doc.name}
+                                </label>
+                                <select
+                                  id={`select-std-${doc.id}`}
+                                  name={`select-std-${doc.id}`}
+                                  value={standardDocNames.includes(draftVal) ? draftVal : ""}
+                                  onChange={(e) => {
+                                    const val = e.target.value;
+                                    if (!val) return;
+                                    setRenameDrafts((prev) => ({ ...prev, [doc.id]: val }));
+                                  }}
+                                  className="border border-slate-300 rounded-lg px-2 py-1 text-[11px] bg-slate-50 hover:bg-white focus:border-slate-900 outline-none text-slate-800 max-w-[155px]"
+                                >
+                                  <option value="">Vælg fra liste...</option>
+                                  {standardDocNames.map((std) => (
+                                    <option key={std} value={std}>
+                                      {std}
+                                    </option>
+                                  ))}
+                                </select>
+
+                                <label htmlFor={`input-rename-${doc.id}`} className="sr-only">
+                                  Skriv eller tilpas filnavn for {doc.name}
+                                </label>
+                                <input
+                                  id={`input-rename-${doc.id}`}
+                                  name={`input-rename-${doc.id}`}
+                                  type="text"
+                                  list="standard-doc-names-datalist"
+                                  autoCorrect="off"
+                                  autoCapitalize="none"
+                                  spellCheck={false}
+                                  enterKeyHint="done"
+                                  value={draftVal}
+                                  onChange={(e) =>
+                                    setRenameDrafts((prev) => ({ ...prev, [doc.id]: e.target.value }))
+                                  }
+                                  onKeyDown={(e) => {
+                                    if (
+                                      e.key === "Enter" &&
+                                      !e.nativeEvent.isComposing &&
+                                      e.keyCode !== 229
+                                    ) {
+                                      e.preventDefault();
+                                      handleRenameAndLearn(doc.id);
+                                    }
+                                  }}
+                                  placeholder="Eget eller standardnavn..."
+                                  className="border border-slate-300 rounded-lg px-2.5 py-1 text-xs bg-white focus:border-slate-900 outline-none text-slate-900 w-40 sm:w-44"
+                                />
+
+                                <button
+                                  type="button"
+                                  onClick={() => handleRenameAndLearn(doc.id)}
+                                  disabled={savingRenameDocId === doc.id || !draftVal.trim()}
+                                  className="px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 disabled:opacity-45 text-white text-[11px] font-bold cursor-pointer flex-shrink-0"
+                                >
+                                  {savingRenameDocId === doc.id ? "Gemmer..." : "Gem & Lær"}
+                                </button>
+                              </div>
+                            </td>
+
+                            <td className="py-2.5 px-3 text-right">
+                              <div className="inline-flex items-center justify-end gap-1.5">
+                                {check?.afsnit11Forslag && (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleAddClauseToAfsnit11(check.afsnit11Forslag!)}
+                                    className="px-2 py-1 rounded-lg bg-amber-100 hover:bg-amber-200 text-amber-900 text-[10px] font-bold cursor-pointer"
+                                    title="Tilføj forbehold til Købsaftalens Afsnit 11"
+                                  >
+                                    + Afsnit 11
+                                  </button>
+                                )}
+                                {doc.objectUrl && (
+                                  <a
+                                    href={doc.objectUrl}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="px-2 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-800 text-[10px] font-semibold"
+                                  >
+                                    Åbn
+                                  </a>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => handleRemoveUploadedItem(doc.id)}
+                                  className="p-1 text-slate-400 hover:text-red-600 cursor-pointer"
+                                  title="Slet dokument"
+                                >
+                                  <Trash2 size={13} />
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <div className="p-6 rounded-xl border-2 border-dashed border-slate-300 bg-slate-50/50 text-center space-y-2">
+                  <p className="text-xs font-semibold text-slate-700">
+                    Træk alle sagens PDF-dokumenter ind her, eller klik på &ldquo;+ Upload dokumenter / PDF&apos;er&rdquo;
+                  </p>
+                  <p className="text-[11px] text-slate-500">
+                    Systemet scanner automatisk indholdet 100 % lokalt (0 kr.), omdøber filerne til jeres faste standard-filnavne og gør dem klar til samlet ZIP-download med ét klik.
+                  </p>
+                </div>
+              )}
+            </div>
+
+            {/* 2. KOMPAKT STATUS PÅ SAGENS 4 KERNEDOKUMENT-KRAV */}
             <div>
               <h3 className="text-[11px] font-bold uppercase tracking-wider text-slate-400 mb-2">
-                1. Status på lovpligtige kernedokumenter
+                2. Status på lovpligtige kernedokumenter
               </h3>
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2 text-xs">
                 <div className="px-3 py-2 rounded-xl bg-emerald-50/70 border border-emerald-200 flex items-center justify-between gap-2">
                   <div className="flex items-center gap-1.5 truncate">
                     <CheckCircle2 size={13} className="text-emerald-600 flex-shrink-0" />
-                    <span className="font-semibold text-slate-800 truncate">BBR, Matrikel & Plandata</span>
+                    <span className="font-semibold text-slate-800 truncate">BBR, Matrikel &amp; Plandata</span>
                   </div>
                   <span className="text-[10px] font-bold text-emerald-800">Hentet</span>
                 </div>
@@ -2644,90 +3144,6 @@ Tlf.: ${currentAgent.phone} · ${currentAgent.email}`;
                   );
                 })}
               </div>
-            </div>
-
-            {/* 2. UPLOADEDE DOKUMENTER & FOTOS (MEGET KOMPAKT, LETLÆSELIG TABEL MED GENKENDT DOKUMENTTYPE) */}
-            <div>
-              <h3 className="text-[11px] font-bold uppercase tracking-wider text-slate-400 mb-2">
-                2. Uploadede dokumenter & fotos ({uploadedDocs.length} stk.)
-              </h3>
-              {uploadedDocs.length > 0 ? (
-                <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden">
-                  {uploadedDocs.map((doc) => {
-                    const check = documentChecks.find((c) => c.fileName === doc.name);
-                    const recognizedType =
-                      doc.detectedCategory || check?.kategori || (doc.type === "photo" ? "Besigtigelsesfoto" : "Sagsdokument");
-                    return (
-                      <div
-                        key={doc.id}
-                        className="px-3 py-2 bg-white hover:bg-slate-50/80 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs"
-                      >
-                        <div className="flex items-center gap-2 min-w-0 flex-1">
-                          <span
-                            className={`text-[10px] font-bold px-1.5 py-0.5 rounded flex-shrink-0 ${
-                              check?.status === "afvigelse"
-                                ? "bg-red-100 text-red-800"
-                                : check?.status === "opmaerksomhed"
-                                ? "bg-amber-100 text-amber-900"
-                                : "bg-emerald-100 text-emerald-800"
-                            }`}
-                          >
-                            {check?.status === "afvigelse"
-                              ? "Afvigelse"
-                              : check?.status === "opmaerksomhed"
-                              ? "OBS"
-                              : "✓ OK"}
-                          </span>
-                          <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-blue-50 text-blue-800 border border-blue-200 flex-shrink-0">
-                            {recognizedType}
-                          </span>
-                          <strong className="text-slate-900 truncate" title={doc.name}>
-                            {doc.name}
-                          </strong>
-                          {check && (
-                            <span className="text-[11px] text-slate-500 truncate hidden md:inline">
-                              — {check.fundOverskrift}
-                            </span>
-                          )}
-                        </div>
-                        <div className="flex items-center gap-1.5 flex-shrink-0">
-                          {check?.afsnit11Forslag && (
-                            <button
-                              type="button"
-                              onClick={() => handleAddClauseToAfsnit11(check.afsnit11Forslag!)}
-                              className="px-2 py-0.5 rounded bg-slate-900 text-white text-[10px] font-semibold cursor-pointer"
-                            >
-                              + Afsnit 11
-                            </button>
-                          )}
-                          {doc.objectUrl && (
-                            <a
-                              href={doc.objectUrl}
-                              target="_blank"
-                              rel="noreferrer"
-                              className="px-2 py-0.5 rounded bg-slate-100 hover:bg-slate-200 text-slate-800 text-[10px] font-semibold"
-                            >
-                              Åbn
-                            </a>
-                          )}
-                          <button
-                            type="button"
-                            onClick={() => handleRemoveUploadedItem(doc.id)}
-                            className="p-1 text-slate-400 hover:text-red-600 cursor-pointer"
-                            title="Slet"
-                          >
-                            <Trash2 size={12} />
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              ) : (
-                <div className="p-4 rounded-xl border border-dashed border-slate-300 bg-slate-50/50 text-center text-xs text-slate-500">
-                  Træk PDF&apos;er, tingbogsattest, byggesagsarkiv, tilstandsrapport eller fotos ind her — de genkendes automatisk på indholdet uanset filnavn.
-                </div>
-              )}
             </div>
 
             {/* 3. AUTOMATISK HENTEDE REGISTERDOKUMENTER (KOMPAKT 1-LINJES RÆKKER) */}

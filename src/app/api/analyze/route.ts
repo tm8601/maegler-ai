@@ -16,6 +16,7 @@ import {
   setCachedAiAnalysis,
 } from "@/lib/ai-cost-guard";
 import {
+  applyAutomaticDocumentRenaming,
   authenticateRequestAgent,
   buildDefaultCheckForMeta,
   calculateFloorplanVsBbr,
@@ -459,12 +460,12 @@ export async function POST(request: Request) {
           uploadedAt: nowTime,
           matchedReminderId: matchedRem,
           detectedCategory: catInfo.categoryLabel,
-          extractedSummary: fileText.slice(0, 2500),
+          extractedSummary: fileText.slice(0, 12000),
         });
       } else {
         existingMeta.matchedReminderId = existingMeta.matchedReminderId || matchedRem;
         existingMeta.detectedCategory = catInfo.categoryLabel || existingMeta.detectedCategory;
-        existingMeta.extractedSummary = fileText.slice(0, 2500) || existingMeta.extractedSummary;
+        existingMeta.extractedSummary = fileText.slice(0, 12000) || existingMeta.extractedSummary;
       }
 
       fileParts.push(buildGeminiPartForBuffer(file.name, buffer, fileText));
@@ -489,11 +490,13 @@ export async function POST(request: Request) {
         if (metaMatch) {
           metaMatch.matchedReminderId = metaMatch.matchedReminderId || catInfo.reminderId;
           metaMatch.detectedCategory = catInfo.categoryLabel || metaMatch.detectedCategory;
-          metaMatch.extractedSummary = fileText.slice(0, 2500) || metaMatch.extractedSummary;
+          metaMatch.extractedSummary = fileText.slice(0, 12000) || metaMatch.extractedSummary;
         }
         fileParts.push(buildGeminiPartForBuffer(df.fileName, df.buffer, fileText));
       }
     }
+
+    const renamedDocMetas = applyAutomaticDocumentRenaming(newDocMetas);
 
     const parsedTingbog = parseDocumentTextForTingbog(combinedRawText);
     if (parsedTingbog.fundetTingbog) {
@@ -561,21 +564,55 @@ export async function POST(request: Request) {
       });
     }
 
-    // 4. Tjek intern 30,00 kr./dag & 3,00 kr./sag AI-budgetlås (Zero-Limbo)
+    // 4. 100 % gratis lokal dokumentgenkendelse & fil-omdøbning som standard (0,00 kr. i API-kald)
+    const usePaidAi = String(formData.get("usePaidAi") || "false") === "true";
+
+    let finalChecks = buildDeterministicChecksForFiles(
+      renamedDocMetas,
+      rawTextsByFile,
+      profile,
+      parsedTingbog,
+      floorplanCheck
+    );
+
+    if (!usePaidAi) {
+      const report = buildDeterministic7StepReport(
+        profile,
+        fileNames,
+        parsedTingbog,
+        finalChecks,
+        floorplanCheck
+      );
+      const updatedCase = upsertSellerCase({
+        id: resolvedCaseId,
+        agentEmail,
+        agentName,
+        address: profile.adresse,
+        profile,
+        uploadedDocMeta: renamedDocMetas,
+        documentChecks: finalChecks,
+        floorplanCheck,
+        resolvedReminderIds: Array.from(resolvedReminders),
+        analysisReport: report,
+      });
+      return NextResponse.json({
+        analysis: report,
+        localZeroCostEngine: true,
+        parsedTingbog,
+        documentChecks: updatedCase.documentChecks,
+        floorplanCheck: updatedCase.floorplanCheck,
+        profile,
+        sellerCase: updatedCase,
+        budget: getTenantBudgetState("vejle-maegleren"),
+      });
+    }
+
     const estimatedCost = Math.max(COST_PER_DOC_ANALYSIS_DKK, Math.max(1, fileParts.length) * 0.05);
     const budgetCheck = checkAndReserveAiBudget({
       tenantId: "vejle-maegleren",
       caseKey: profile.adresse,
       estimatedCostDkk: estimatedCost,
     });
-
-    let finalChecks = buildDeterministicChecksForFiles(
-      newDocMetas,
-      rawTextsByFile,
-      profile,
-      parsedTingbog,
-      floorplanCheck
-    );
 
     if (!budgetCheck.allowed || !process.env.GEMINI_API_KEY || fileParts.length === 0) {
       releaseInFlightLock(profile.adresse);
