@@ -13,6 +13,16 @@ export function getDataforsyningenToken(): string {
   return process.env.DATAFORSYNINGEN_TOKEN || "";
 }
 
+const DAR_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function isValidDarUuid(value: unknown): value is string {
+  return typeof value === "string" && DAR_UUID_RE.test(value.trim());
+}
+
+function isValidBfeNumber(value: unknown): value is string {
+  return typeof value === "string" && /^\d{1,12}$/.test(value.trim());
+}
+
 export function getDatafordelerKeys(): string[] {
   const keys = [
     process.env.DATAFORDELER_FALLBACK_KEY,
@@ -1010,11 +1020,12 @@ async function fetchLastSaleFact(opts: {
   previousSales: Array<{ prisDkk: number; dato: string; typeTekst: string }>;
 } | null> {
   // 1. Forsøg Datafordeleren EJF v1
-  if (opts.bfeNummer) {
+  const cleanBfe = opts.bfeNummer && isValidBfeNumber(String(opts.bfeNummer)) ? String(opts.bfeNummer).trim() : null;
+  if (cleanBfe) {
     const ejfData = await fetchDatafordelerGraphQL(
       "EJF/v1",
       `query {
-        EJF_Handelsoplysninger(first: 10, where: { bfeNummer: { eq: "${opts.bfeNummer}" } }) {
+        EJF_Handelsoplysninger(first: 10, where: { bfeNummer: { eq: "${cleanBfe}" } }) {
           nodes {
             samletKoebesum
             kontantKoebesum
@@ -1906,8 +1917,10 @@ export async function buildFullPropertyProfile(
     null;
 
   let officialAddress = exactSug?.tekst || rawAddress;
-  let husnummerId = hint?.husnummerId || exactSug?.adresse?.adgangsadresseid || exactSug?.adresse?.id || "";
-  let adresseId = exactSug?.adresse?.id || husnummerId;
+  const rawHusnummerId = hint?.husnummerId || exactSug?.adresse?.adgangsadresseid || exactSug?.adresse?.id || "";
+  const rawAdresseId = exactSug?.adresse?.id || rawHusnummerId;
+  let husnummerId = isValidDarUuid(rawHusnummerId) ? rawHusnummerId.trim() : "";
+  let adresseId = isValidDarUuid(rawAdresseId) ? rawAdresseId.trim() : "";
   let lat = hint?.lat || exactSug?.adresse?.lat || 55.7093;
   let lon = hint?.lon || exactSug?.adresse?.lon || 9.5357;
   let vejnavn = exactSug?.adresse?.vejnavn || parsedInit.vejnavn;
@@ -1956,7 +1969,8 @@ export async function buildFullPropertyProfile(
     postnr = p.postnr || postnr;
     bynavn = p.bynavn || bynavn;
 
-    if (darNode.adgangspunkt) {
+    if (darNode.adgangspunkt && isValidDarUuid(String(darNode.adgangspunkt))) {
+      const cleanAdgangspunkt = String(darNode.adgangspunkt).trim();
       const apData = await fetchDatafordelerGraphQL(
         "DAR/v3",
         `query {
@@ -1964,7 +1978,7 @@ export async function buildFullPropertyProfile(
             first: 1,
             virkningstid: "${now}",
             registreringstid: "${now}",
-            where: { id_lokalId: { eq: "${darNode.adgangspunkt}" } }
+            where: { id_lokalId: { eq: "${cleanAdgangspunkt}" } }
           ) {
             nodes {
               id_lokalId
@@ -2127,15 +2141,17 @@ export async function buildFullPropertyProfile(
     bygningNodes.find((b) => Number(b.byg039BygningensSamledeBoligAreal) > 0);
   const mainBuilding = linkedBuilding || byCodeBuilding || bygningNodes[0] || null;
 
+  const mainBuildingId = isValidDarUuid(mainBuilding?.id_lokalId) ? mainBuilding.id_lokalId.trim() : null;
+
   // Hvis BBR_Enhed ikke blev fundet på adresseIdentificerer, hent den på hovedbygningens id_lokalId
-  if (enhedNodes.length === 0 && mainBuilding?.id_lokalId) {
+  if (enhedNodes.length === 0 && mainBuildingId) {
     const enhedByByg = await fetchDatafordelerGraphQL(
       "BBR/v3",
       `query {
         BBR_Enhed(
           virkningstid: "${now}",
           registreringstid: "${now}",
-          where: { bygning: { eq: "${mainBuilding.id_lokalId}" }, status: { eq: "6" } }
+          where: { bygning: { eq: "${mainBuildingId}" }, status: { eq: "6" } }
         ) {
           nodes {
             id_lokalId
@@ -2168,21 +2184,22 @@ export async function buildFullPropertyProfile(
   }
   const { easting, northing } = wgs84ToUtm32(lat, lon);
 
-  const mainJordstykkeId = mainBuilding?.jordstykke || darJordstykkeId || null;
+  const rawMainJordstykkeId = mainBuilding?.jordstykke || darJordstykkeId || null;
+  const mainJordstykkeId = isValidDarUuid(rawMainJordstykkeId) ? rawMainJordstykkeId.trim() : null;
   const allJordstykkeIds = [
-    ...new Set([mainJordstykkeId, darJordstykkeId, ...bygningNodes.map((b) => b.jordstykke)].filter(Boolean).map(String)),
+    ...new Set([mainJordstykkeId, darJordstykkeId, ...bygningNodes.map((b) => b.jordstykke)].filter((id) => isValidDarUuid(id)).map((id) => String(id).trim())),
   ];
 
   // 4. Hent BBR_Etage, Sekundære bygninger på jordstykket, BBR_Grund, BBR_TekniskAnlaeg, BBR_Byggesag & Matrikel (MAT/v2) parallelt
   const [etageData, plotBuildingsData, matData, grundData, tekData] = await Promise.all([
-    mainBuilding?.id_lokalId
+    mainBuildingId
       ? fetchDatafordelerGraphQL(
           "BBR/v3",
           `query {
             BBR_Etage(
               virkningstid: "${now}",
               registreringstid: "${now}",
-              where: { bygning: { eq: "${mainBuilding.id_lokalId}" }, status: { eq: "6" } }
+              where: { bygning: { eq: "${mainBuildingId}" }, status: { eq: "6" } }
             ) {
               nodes {
                 id_lokalId
@@ -2342,7 +2359,7 @@ export async function buildFullPropertyProfile(
           first: 1,
           virkningstid: "${now}",
           registreringstid: "${now}",
-          where: { id_lokalId: { eq: "${primaryMatNode.ejerlavLokalId}" } }
+          where: { id_lokalId: { eq: ${JSON.stringify(String(primaryMatNode.ejerlavLokalId))} } }
         ) {
           nodes {
             ejerlavsnavn
